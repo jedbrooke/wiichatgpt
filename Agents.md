@@ -1,0 +1,1 @@
+NEVER update README.md unless asked. Keep prose to a minimum in documents. Chat is fine.
