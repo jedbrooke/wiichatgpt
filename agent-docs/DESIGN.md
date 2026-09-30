@@ -7,11 +7,13 @@
 | CPU | Broadway PowerPC 750CL, 729 MHz | 2x integer ALU, 1x FPU with paired singles |
 | CPU FP peak | ~2.9 GFLOPS | via `ps_madd` (2 FMACs/cycle) |
 | CPU INT peak | ~729M multiply/sec | single IU for `mullw` |
-| GPU | Hollywood (ATI), 243 MHz | Fixed-function TEV pipeline, 4 pixel pipes |
+| GPU | Hollywood (ATI), 243 MHz | Fixed-function pipeline: XF + TEV + indirect tex |
 | GPU TEV peak | ~15.6 GOPS (8-bit) | 243 MHz x 4 pixels/clock x 16 stages |
+| GPU XF peak | ~6-18M vertices/sec | fp32 matrix-vector transforms |
+| GPU pixel fillrate | ~972 Mpixels/sec | 4 pixel pipes |
 | MEM1 | 24 MB 1T-SRAM | CPU main memory, ~1.9 GB/s |
 | MEM2 | 64 MB GDDR3 | GPU-accessible, ~3.9 GB/s |
-| GPU embedded | 3 MB on-die | EFB, internal bandwidth ~30 GB/s |
+| GPU embedded | 3 MB on-die | EFB + texture cache, internal bandwidth ~30 GB/s |
 | L1 cache | 32 KB I + 32 KB D | |
 | L2 cache | 256 KB | |
 | SD card | ~25 MB/s sequential | Hardware controller bottleneck |
@@ -34,17 +36,18 @@
 +---------------------------+
   |          |
   v          v
-+------+  +------------------+
-| CPU  |  | GPU (TEV)        |
-| 750CL|  | 16 stages        |
-| 729M |  | 4 pixels/clock   |
-+------+  +------------------+
++------+  +---------------------------+
+| CPU  |  | GPU (Hollywood)           |
+| 750CL|  | XF: vertex transforms     |
+| 729M |  | TEV: 16-stage pixel pipe  |
+|      |  | Indirect tex: LUT lookups |
++------+  +---------------------------+
   |          |
   | activations, reductions,
-  | PLE lookup, setup
+  | attention, PLE, small matvecs
   |          |
-  |   tiled matmul
-  |   (attn proj, FFN)
+  |   large matvecs (tiled)
+  |   (output head, QKV, FFN)
   v          v
 +---------------------------+
 |  MEM1 (24MB 1T-SRAM)     |
@@ -81,90 +84,222 @@ This is what makes a ~1B model feasible on 88MB of total RAM. The dense core tha
 
 **Reference:** esp32-ai runs a 28.9M param model (25M in PLE, 559K dense core) at 9.88 tok/s on an ESP32-S3 with only 512KB SRAM + 8MB PSRAM + 16MB flash.
 
-## Compute Strategy
+## GPU Hardware Inventory
 
-### GPU: Tiled TEV Matmul
+The Hollywood GPU has three compute-capable subsystems. Previous versions of this document only considered the TEV. All three are relevant.
 
-**Theoretical peak:** 243 MHz x 4 pixels/clock x 16 TEV stages x 4 RGBA channels = **~62 billion 8-bit multiply-accumulate ops/sec** (counting 4 channels per pixel per stage).
+### TEV (Texture Environment Unit)
 
-More conservatively, counting useful MAC ops: **~15.6 GOPS** at 8-bit precision.
+The per-pixel color combiner. 16 programmable stages, 4 pixel pipes running at 243 MHz.
 
-**TEV combiner formula per stage:**
+**Per-stage formula:**
 ```
 out = (d +/- ((1-c)*a + c*b) + bias) * scale
 ```
 
-With `a=ZERO, b=KONST, c=RASC, d=accumulator`, this computes `RASC * KONST + accumulator` per channel, a fused multiply-add.
+With `a=ZERO, b=KONST, c=RASC, d=ZERO`, this computes `RASC * KONST` per channel (a multiply). With `d=accumulator`, it becomes a fused multiply-add.
 
-**Tiled approach:**
-1. Pack weight matrix tiles as GX textures (RGBA8 = 4 values per texel)
-2. Activations encoded as vertex colors or a second texture
-3. Render a large quad covering many output pixels (EFB is 640x528 = 337K pixels)
-4. Each pixel computes one output element's partial dot product
-5. Chain 16 TEV stages for 16 x 4 = 64 MACs per pixel per pass
-6. Multi-pass with `GX_CopyTex` for dot products longer than 64 elements
-7. Read results back via batch `GX_CopyTex` (not per-pixel `GX_PeekARGB`)
+**Capabilities:**
+- 4 RGBA channels per pixel (4 values processed in parallel)
+- 8-bit unsigned / 10-bit signed per channel
+- Operations: multiply, add, subtract, lerp, clamp, scale (x1, x2, x4, /2)
+- 4 konst color registers, 4 TEV output registers (TEVPREV + TEVREG0-2)
+- 8 texture map slots, 8 texture coordinate slots
+- EFB: 640x528 = 337K pixels as compute output elements
 
-**Per-pass throughput at theoretical peak:**
-- 337K pixels x 64 MACs/pixel = ~21.6M MACs per pass
+**Cannot do:** exp, sqrt, division, cross-pixel reduction, anything requiring >8-bit precision per pass.
+
+**Peak:** ~15.6 GOPS (8-bit MACs), ~972 Mpixels/sec fillrate.
+
+### XF (Transform Unit)
+
+The vertex transform engine. Runs at 243 MHz, does fp32 matrix-vector multiplies in hardware.
+
+**Resources:**
+- 10 position/normal matrix slots (4x3 fp32 each, 12 floats per matrix)
+- 10 texture matrix slots (4x3 fp32)
+- 20 dual/post-transform matrix slots (4x3 fp32)
+- 8 hardware lights (each computes N.L dot product: fp32 internally, 8-bit color output)
+- 8 texgen stages (each computes a 2x4 or 3x4 matrix * input vector, results as fp32 texture coordinates)
+
+**Throughput:** ~6-18M vertices/sec depending on configuration.
+
+**For compute:** Texgen stages are the most interesting: each produces 2-3 fp32 outputs per vertex as texture coordinates. With 8 texgen stages, one vertex produces up to 24 fp32 values. The lighting unit computes 8 independent N.L dot products per vertex, but outputs are clamped to 8-bit color, limiting usefulness for precision-sensitive work.
+
+**Precision through the pipeline:** XF texgen outputs are fp32. The rasterizer interpolates them in fp32 (perspective-correct). The TEV receives texture coordinates as **s17.7 fixed-point** (signed, 24 usable bits), confirmed via the Dolphin software rasterizer (`pixel_float * 128`). This is distinct from the TEV *color* pipeline, which is 8-bit. Texcoords used as texture addresses retain much more precision than TEV color math.
+
+**Current status:** Not yet used. Evaluated for general fp32 matmul acceleration and rejected: XF throughput is ~48-144M fp32 dot products/sec (8 texgens * 6-18M vertices/sec), which is 6-17x slower than the CPU paired-singles path (~850M MACs/sec sustained). There is no direct CPU readback of texcoord values (only EFB color and depth are readable). Packing work into many vertices to increase XF utilization starves the TEV (the XF becomes the pipeline bottleneck). The XF is viable for one specific role: using fp32 dot product results as high-precision (s17.7) LUT addresses for activation functions. See Stretch Goal 3.
+
+### Indirect Texture Unit
+
+Per-TEV-stage texture coordinate manipulation via a 2x3 fixed-point matrix multiply.
+
+**Resources:**
+- 3 programmable 2x3 matrices (S0.10 fixed-point, ~11-bit precision per element)
+- Scale exponent: power-of-2 shift from 2^-32 to 2^+31
+- Applied per-pixel as part of texture coordinate generation before the final texture fetch
+
+**For compute:** The primary use is activation function LUTs. Bake `sigmoid(x)`, `exp(x)`, or `1/sqrt(x)` into a 256-entry texture. An indirect texture lookup converts a TEV intermediate value through the nonlinearity without leaving the GPU.
+
+**Current status:** Not yet used. Planned as a stretch goal for keeping the FFN pipeline (gate matmul -> SiLU -> elementwise mul -> down matmul) entirely on the GPU.
+
+### EFB Blending
+
+Hardware alpha/color blending at the framebuffer write stage.
+
+**For compute:** `GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, ...)` configures additive blending: each new render pass adds its results directly to the existing EFB contents. This enables multi-pass dot product accumulation without CPU readback between passes. Instead of: render pass 1 -> EFB copy -> CPU accumulate -> render pass 2, we get: render pass 1 -> render pass 2 (additive) -> ... -> render pass N -> single EFB copy.
+
+**Precision constraint:** Results are still clamped to 8-bit per channel after each blend. For this to work, per-pass partial sums must be small enough that accumulated totals stay within [0, 255]. For INT4 weights in [0,1] range with 64 MACs per pass, each pass contributes roughly ~8-16/255, so 8 passes total ~64-128/255. This is within range.
+
+## Compute Strategy
+
+### Design Principles
+
+1. **CPU is the baseline for everything.** The paired-singles INT8 dequant path (`psq_l` + `ps_madd`) handles all operations at fp32 precision. Every GPU acceleration must beat the CPU path or it is not worth the complexity.
+
+2. **GPU wins on parallelism, not precision.** The CPU does fp32 natively. The GPU's TEV is 8-bit. GPU paths are worth it only when we can process enough independent operations in parallel to overcome setup overhead and tolerate quantization noise.
+
+3. **Minimize CPU<->GPU round-trips.** Each EFB readback costs ~1-2 ms. The best GPU workloads render many pixels across multiple passes (using additive blend), then read back once.
+
+4. **The output head dominates compute.** Per esp32-ai's profile (the closest reference architecture), the output head consumes ~63% of per-token compute. It is the highest-priority GPU target.
+
+### GPU: Tiled TEV Matmul with Additive Blend
+
+The GPU handles large matrix-vector multiplies: operations where the output dimension is large enough to fill a significant portion of the EFB, and the inner dimension is large enough that the compute exceeds GPU setup costs.
+
+**How it works (for y = W*x, W is [M, K]):**
+
+1. Pack weight matrix tiles as GX textures (RGBA8 = 4 values per texel). Each texel holds 4 weight values.
+
+2. Encode the input activation vector as vertex colors (4 values per vertex via RGBA) or as a second texture.
+
+3. Configure TEV stages for multiply-accumulate:
+   - `a=ZERO, b=KONST, c=RASC, d=ZERO` computes `RASC * KONST` per channel
+   - Chain 16 stages for 16 x 4 = 64 MACs per pixel per pass
+   - Each pixel in the EFB computes one output element's partial dot product
+
+4. Render a full-screen quad. With EFB at 640x528 = 337K pixels, each draw call produces up to 337K output elements. For a matvec with M output rows, use M pixels.
+
+5. For K > 64 (dot products longer than one pass), use **EFB additive blending** (`GX_BL_ONE + GX_BL_ONE`). Each subsequent pass uploads the next weight tile, re-renders, and the hardware adds the new partial sums directly to the EFB contents. No CPU readback between passes.
+
+6. After all passes complete, one `GX_CopyTex` reads the final accumulated results from the EFB into a MEM2 buffer. The CPU dequantizes the 8-bit results back to fp32.
+
+**Per-pass timing:**
 - Full-screen render at 4 pixels/clock: 337K / (243M x 4) = ~0.35 ms
-- With setup + EFB copy overhead, estimate ~2-3 ms per pass
-- Effective throughput: **~7-21 GOPS**
+- With texture fetch + 16 TEV stages: ~1-2 ms per pass
+- K=512 needs 8 passes: ~8-16 ms total render time
+- One final EFB copy: ~1-2 ms
+- Total per large matvec: ~10-18 ms
 
 **Tile size considerations:**
 - EFB: 640 x 528 pixels, each producing one output element
 - With 64 MACs/pixel/pass, a K=512 dot product needs ~8 passes
-- Output matrix up to ~580 x 580 per draw call
+- Output dimension up to ~337K per draw call (far more than any single matvec needs)
+
+**Precision model:**
+- Weights and activations quantized to [0, 255] (8-bit unsigned)
+- TEV multiply: `a * b / 255` per channel (fixed-point with +128 rounding)
+- Additive blend accumulates 8-bit partial sums, clamped to [0, 255]
+- CPU reads back 8-bit results and scales to fp32
+- For INT4 weights (values -7..7 mapped to ~0..255 via offset), the quantization noise is roughly comparable to running the full model at INT4, which is the storage precision anyway
 
 ### CPU: Paired Singles + GQR Dequant
 
-**Peak:** ~2.9 GFLOPS (729 MHz x 2 lanes x 2 ops/FMAC)
+The CPU is the primary compute path. All operations run here. Large matvecs are optionally offloaded to the GPU when the GPU path is validated.
+
+**Peak:** ~2.9 GFLOPS (729 MHz x 2 lanes x 2 ops/FMAC).
+**Sustained:** ~1.7 GFLOPS at ~60% utilization.
 
 **The GQR hardware dequant path:**
 - `psq_l frD, addr, W, GQR_index` loads 2x INT8 values from memory and **automatically converts them to fp32 pairs** in a single instruction
 - GQR Type field `6` = signed 8-bit (s8), with a configurable power-of-2 scale factor
 - Combined with `ps_madd` for the multiply-accumulate
 
-This means: weights stay as INT8 in memory (half the bandwidth vs fp32), but computation happens in fp32 via hardware dequant-on-load. This is the same pattern as llama.cpp's Q8_0 format.
+Weights stay as INT8 in memory (half the bandwidth vs fp32), computation happens in fp32 via hardware dequant-on-load. This is the same pattern as llama.cpp's Q8_0 format.
 
-**CPU handles:**
-- Activation functions (SiLU, softmax, RMSNorm): elementwise, no TEV benefit
-- Partial sum reduction from multi-pass TEV results
-- PLE table lookups from SD card
-- GX draw call setup, texture uploads
-- KV cache management
+### Operation Assignment
 
-### Combined Throughput
+**GPU (TEV tiled matmul, large matvecs only):**
 
-Assuming the GPU handles the big matmuls (attention projections, FFN) and the CPU handles everything else in parallel:
+| Operation | Shape (per layer) | Priority | Rationale |
+|---|---|---|---|
+| Output head | [V, D] * x | Highest | ~63% of compute, V=32K independent dot products |
+| FFN gate | [F, D] * x | High | Large, many output elements |
+| FFN up | [F, D] * x | High | Same shape as gate, can batch |
+| FFN down | [D, F] * g | High | Large inner dimension |
+| QKV projection | [3D, D] * x | High | Large, 3D output elements |
+| Attention output proj | [D, D] * att | High | Large |
+| PLE model projection | [L*P, D] * x | Medium | Large (L*P can be ~3000+) |
 
-| Component | Theoretical | Notes |
-|---|---|---|
-| GPU TEV matmul | ~15.6 GOPS (8-bit) | Tiled, batched, multi-pass |
-| CPU paired singles | ~2.9 GFLOPS (fp32) | Activations, reductions |
-| PLE disk I/O | ~1-2 ms/token | Negligible |
-| Combined | ~18+ GOPS effective | If CPU/GPU overlap well |
+**CPU (always, not offloaded):**
 
-### Path to Full GPU Utilization
+| Operation | Rationale |
+|---|---|
+| RMSNorm | Requires reduction (sum of squares) then elementwise. Reductions cannot parallelize across pixels. |
+| Softmax | Requires reduction (max, sum) and exp(). Reduction-heavy. |
+| SiLU / GELU activation | Elementwise nonlinear. Trivial on CPU, not worth GPU round-trip unless part of a larger GPU pipeline (see stretch goals). |
+| SwiGLU elementwise multiply | Small elementwise op between two FFN results. |
+| RoPE | Trig (cos/sin) + elementwise on small vectors. Computed once per position, reused across layers. |
+| Residual adds | Trivial elementwise (size D), not worth GPU overhead. |
+| Attention scores (Q.K) | Many small dot products (head_size ~32-96) + softmax + weighted V sum. Precision-sensitive (softmax requires fp32). Reduction-heavy. |
+| PLE table lookups | SD card I/O, CPU-managed. |
+| PLE combine | Small elementwise (size L*P). |
+| Small matvecs: PLE gate [P, D], PLE proj [D, P] | P=128-256, too small to amortize GPU setup overhead. |
+| KV cache management | Memory operations. |
+| GX draw call setup, texture uploads | CPU-side GPU control. |
+| Sampling (argmax / top-p) | Sequential, tiny. |
 
-The gap between theoretical (~15.6 GOPS) and realistic throughput comes from:
+### CPU/GPU Overlap
 
-1. **EFB copy latency.** Each multi-pass round trip requires a `GX_CopyTex` blit. Measured latency on real hardware is needed, but estimated at ~1-2ms per copy. Mitigation: maximize MACs per pass to amortize copy cost (use all 16 stages, full EFB coverage).
+While the GPU renders the current matvec, the CPU processes:
+- The previous matvec's result (activation function, normalization)
+- PLE lookups from SD card (I/O overlapped with GPU compute)
+- KV cache writes
+- Next matvec's weight texture preparation and upload
 
-2. **Draw call setup overhead.** Each TEV pass requires configuring stages, loading textures, issuing vertex data. The GX FIFO command stream adds latency. Mitigation: minimize the number of passes by packing more work per pass; pre-build command lists where possible.
+The pipeline within a single layer looks like:
 
-3. **8-bit precision accumulation.** TEV operates on 8-bit unsigned / signed 10-bit fixed-point. A 512-element dot product accumulated in 8-bit space will overflow. Mitigation: multi-pass with CPU-side fp32 accumulation of per-pass partial sums. The TEV computes 64-element partial dot products (fitting in 8-bit), CPU accumulates them.
+```
+CPU: rmsnorm -> [upload QKV weights]
+GPU:            [render QKV matvec...............] -> copytex
+CPU:                                                  RoPE, attn scores, softmax, weighted V
+CPU: [upload attn_proj weights]
+GPU: [render attn_proj matvec...] -> copytex
+CPU:                                 residual add, rmsnorm -> [upload FFN weights]
+GPU:                                                          [render gate+up matvecs...] -> copytex
+CPU:                                                                                        SiLU, SwiGLU mul
+...
+```
 
-4. **Texture upload bandwidth.** Weight tiles must be uploaded as GX textures before each pass. At ~3.9 GB/s MEM2 bandwidth, a 256x256 RGBA8 tile (256KB) takes ~0.065ms to upload, but `GX_LoadTexObj` has CPU overhead. Mitigation: double-buffer textures, upload while GPU is rendering the previous tile.
+### Stretch Goals
 
-5. **Quantization error.** The TEV's 8-bit fixed-point introduce quantization noise. For INT4 weights dequantized to 8-bit TEV space, this may be acceptable. Needs empirical validation via the GX simulator.
+1. **Indirect texture activation LUTs:** Bake SiLU/GELU into a 256-entry texture. After the FFN gate matvec renders into the EFB, apply the activation via an indirect texture lookup in a follow-up TEV pass, keeping the data on-GPU between the gate and the SwiGLU multiply. This avoids a CPU round-trip for the activation.
+
+2. **Full FFN pipeline on GPU:** gate matmul -> SiLU (via indirect LUT) -> elementwise mul with up matmul -> down matmul, all as consecutive GPU render passes without EFB readback until the final result. This is the maximum GPU utilization scenario.
+
+3. **XF texgen-addressed activation LUTs:** Use XF texgen to compute a fp32 dot product per vertex, then use the result (delivered to the TEV as an s17.7 texcoord, 24 usable bits) to address a 1D LUT texture containing SiLU/GELU values. This applies the nonlinearity at 24-bit addressing precision. In the FFN pipeline, the gate matmul partial sums accumulate in the TEV at 8-bit, but the activation function lookup uses the higher-precision texcoord path, improving the error profile where nonlinearities are most sensitive (near zero). Requires routing the gate output through a texgen stage, which limits this to cases where the dot product can be expressed as a single 3x4 or 2x4 matrix-vector multiply per texgen channel.
+
+### Throughput: GPU Path to Full Utilization
+
+The gap between theoretical TEV peak (~15.6 GOPS) and realistic throughput:
+
+1. **EFB additive blend precision.** Multi-pass accumulation in 8-bit space. Per-pass partial sums must stay small enough to avoid saturation. Validation needed via the GX simulator, then on real hardware.
+
+2. **Draw call setup overhead.** Each pass requires configuring TEV stages, loading weight textures, issuing vertex data. The GX FIFO command stream adds latency. Mitigation: minimize passes by using all 16 TEV stages, pre-build command buffers where possible.
+
+3. **Texture upload bandwidth.** Weight tiles must be uploaded as GX textures before each pass. At ~3.9 GB/s MEM2 bandwidth, a 256x256 RGBA8 tile (256KB) takes ~0.065ms, but `GX_LoadTexObj` has CPU overhead. Mitigation: double-buffer textures, upload the next tile while GPU renders the current one.
+
+4. **EFB copy latency.** The final readback via `GX_CopyTex` after all passes. Estimated ~1-2 ms per copy. Only one copy per matvec (not per pass, thanks to additive blend).
+
+5. **Quantization error.** 8-bit TEV math with 8-bit EFB accumulation introduces noise. For INT4 weights already stored at 4-bit precision, the additional TEV quantization error may be acceptable. Needs empirical validation.
 
 **Validation milestones:**
-1. Tiled matmul in the GX simulator (correctness)
+1. Tiled matmul with additive blend in the GX simulator (correctness + precision)
 2. Benchmark on Dolphin emulator with GPU timing
 3. Benchmark on real Wii hardware
-4. Compare GPU matmul throughput vs CPU paired-singles baseline
+4. Compare GPU matmul throughput vs CPU paired-singles baseline at each matrix size
 5. Profile EFB copy and draw call overhead to find the real utilization ceiling
+6. End-to-end inference quality comparison: GPU-accelerated vs CPU-only
 
 ## Inference Stack
 
@@ -179,7 +314,7 @@ The gap between theoretical (~15.6 GOPS) and realistic throughput comes from:
 1. Get llama2.c running on devkitPPC with the 260K TinyStories model (validates toolchain, SD loading, basic inference)
 2. Integrate PLE from esp32-ai for the embedding architecture
 3. Replace the naive matmul with paired-singles CPU kernel (`psq_l` + `ps_madd`)
-4. Add TEV-accelerated tiled matmul backend for large matmuls
+4. Add TEV-accelerated tiled matmul backend for large matvecs
 5. Scale up model size, validate with increasingly large models
 6. If needed, migrate toward ggml backend for better quantization formats (GGUF, Q4_K, etc.)
 
@@ -201,6 +336,20 @@ Custom trained/fine-tuned, ~500M-1B params, PLE architecture.
 - Standard embedding + tied lm_head for output projection
 
 **Domain:** Wii trivia, popular Wii games, Nintendo lore. Not general-purpose.
+
+### Per-token operation breakdown
+
+From esp32-ai's profile (28.9M model, 559K dense core, ESP32-S3), the per-token compute breaks down as:
+
+| Stage | ms/token | Share | Operations |
+|---|---|---|---|
+| Output head | 59.4 | 63% | Single large matvec [V, D] * x |
+| Attention | 20.5 | 22% | QKV matvec + RoPE + Q.K scores + softmax + weighted V + attn_proj matvec |
+| PLE path | 6.4 | 7% | PLE model proj matvec + PLE gate matvec + GELU + PLE proj matvec + RMSNorm |
+| FFN | 6.5 | 7% | Gate matvec + up matvec + SiLU + SwiGLU mul + down matvec + RMSNorm |
+| Input | 2.2 | 2% | Embedding lookup + PLE table lookup + PLE combine |
+
+The output head alone is 63% of compute. At the Wii's larger model sizes the ratios shift (the head shrinks proportionally as the per-layer ops grow with more layers), but it remains a substantial fraction.
 
 ## Memory Map (target)
 
@@ -263,7 +412,7 @@ All numbers assume the PLE architecture (dense core in RAM, PLE table on SD card
 
 ### tok/s estimates: CPU + GPU combined (overlapped)
 
-GPU handles the big matmuls (attention projections, FFN), CPU handles activations/reductions in parallel.
+GPU handles the large matvecs (output head, QKV, FFN projections), CPU handles attention scores, activations, reductions, PLE, and small matvecs in parallel.
 
 | Dense core | Total model | Conservative | Optimistic |
 |---|---|---|---|
@@ -291,8 +440,16 @@ GPU handles the big matmuls (attention projections, FFN), CPU handles activation
 
 ## Open Questions
 
-1. **TEV matmul precision:** Can 8-bit TEV math with multi-pass CPU accumulation match INT8 inference quality? Needs simulation and empirical testing.
-2. **EFB copy latency:** Real hardware timing for `GX_CopyTex` is not well documented. This is the make-or-break number for GPU utilization.
-3. **Model architecture details:** Exact layer count, hidden dim, head count, PLE dim, for a ~1B model that fits the memory budget. Jake needs these constraints for training.
-4. **DVD random read performance:** PLE lookups are random-access by token ID. DVD seek latency (~100ms) may make DVD impractical for PLE; SD card (low-ms seek) is likely required. DVD may still work for sequential weight loading at boot.
-5. **Context length:** KV cache size scales linearly with context. At 24 layers x 512 hidden x 2 (K+V) x fp32, each token position costs ~96KB. A 256-token context = ~24MB of KV cache, consuming most of MEM1. May need INT8 KV cache or shorter context.
+1. **EFB additive blend precision:** Can multi-pass 8-bit additive accumulation produce usable results for a 512-element dot product? Per-pass partial sums must stay within [0, 255] range across all passes. Needs validation in the GX simulator and empirically on hardware.
+
+2. **EFB copy latency:** Real hardware timing for `GX_CopyTex` is not well documented. Only one copy per matvec (thanks to additive blend), but this is still the GPU path's fixed overhead. This is the make-or-break number for GPU utilization.
+
+3. **GPU vs CPU crossover point:** At what matrix size does the GPU TEV path actually beat CPU paired-singles? Small matvecs (PLE gate at [128, D]) almost certainly lose to CPU due to setup overhead. Large ones (output head at [32K, D]) should win. The crossover needs measurement.
+
+4. **Model architecture details:** Exact layer count, hidden dim, head count, PLE dim, for a ~1B model that fits the memory budget. Jake needs these constraints for training.
+
+5. **DVD random read performance:** PLE lookups are random-access by token ID. DVD seek latency (~100ms) may make DVD impractical for PLE; SD card (low-ms seek) is likely required. DVD may still work for sequential weight loading at boot.
+
+6. **Context length:** KV cache size scales linearly with context. At 24 layers x 512 hidden x 2 (K+V) x fp32, each token position costs ~96KB. A 256-token context = ~24MB of KV cache, consuming most of MEM1. May need INT8 KV cache or shorter context.
+
+7. **XF compute potential (resolved):** The XF is not viable as a general fp32 matmul accelerator: throughput is 6-17x slower than CPU paired-singles, there is no CPU readback of texcoord values (only EFB color/depth), and packing work into many vertices starves the TEV. However, texgen outputs enter the TEV as s17.7 fixed-point texcoords (24 usable bits), which makes the XF useful for high-precision LUT addressing in activation functions. See Stretch Goal 3.
