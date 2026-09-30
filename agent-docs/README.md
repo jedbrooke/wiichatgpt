@@ -1,0 +1,1 @@
+docs in this dir a written by agent, read at your own risk. Better to ask your agent to read this for you.
