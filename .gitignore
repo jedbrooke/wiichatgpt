@@ -1,3 +1,4 @@
 devkitpro-pacman-installer.pkg
 sim/build-*/
 reference/
+sim/build

@@ -52,6 +52,22 @@ u32 GX_GetTexBufferSize(u16 wd, u16 ht, u32 fmt, u8 mipmap, u8 maxlod);
 void GX_SetNumTexGens(u32 nr);
 void GX_SetTexCoordGen(u16 texcoord, u32 tgen_typ, u32 tgen_src, u32 mtxsrc);
 
+// XF matrix loading
+void GX_LoadTexMtxImm(const f32 mtx[][4], u32 texmtx, u8 type);
+void GX_LoadPosMtxImm(const f32 mtx[][4], u32 pnmtx);
+void GX_LoadNrmMtxImm(const f32 mtx[][4], u32 pnmtx);
+void GX_SetCurrentMtx(u32 pnmtx);
+
+// Indirect texture configuration
+void GX_SetNumIndStages(u8 num);
+void GX_SetIndTexOrder(u8 ind_stage, u8 texcoord, u8 texmap);
+void GX_SetIndTexCoordScale(u8 ind_stage, u8 scale_s, u8 scale_t);
+void GX_SetIndTexMtx(u8 ind_mtx, const f32 offset_mtx[2][3], s8 scale_exp);
+void GX_SetTevIndirect(u8 tevstage, u8 ind_stage, u8 format,
+                        u8 bias_sel, u8 matrix_sel,
+                        u8 wrap_s, u8 wrap_t,
+                        u8 add_prev, u8 utc_lod, u8 alpha_sel);
+
 // Color channels
 void GX_SetNumChans(u8 num);
 

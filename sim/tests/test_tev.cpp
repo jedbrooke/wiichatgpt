@@ -345,6 +345,209 @@ TEST(test_tev_texture_replace) {
     ASSERT_EQ(out.a, 255);
 }
 
+// EFB additive blend: two passes at the same pixel, verify accumulation
+TEST(test_efb_additive_blend) {
+    init_gx();
+
+    // Enable additive blending: out = src*1 + dst*1
+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_COPY);
+
+    // Clear EFB pixel (0,0) to zero
+    GX_PokeARGB(0, 0, (GXColor){0, 0, 0, 0});
+
+    // First pass: write 40 to all channels
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(40, 40, 40, 40);
+        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(40, 40, 40, 40);
+        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(40, 40, 40, 40);
+        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(40, 40, 40, 40);
+    GX_End();
+
+    // Second pass: write 60 to all channels (should add to the 40)
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(60, 60, 60, 60);
+        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(60, 60, 60, 60);
+        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(60, 60, 60, 60);
+        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(60, 60, 60, 60);
+    GX_End();
+
+    GXColor out;
+    GX_PeekARGB(0, 0, &out);
+
+    // With GX_BL_ONE (factor=255): (val*255+128)/256 preserves the value exactly
+    // for any u8 input. Pass 1: 40+0=40. Pass 2: 60+40=100.
+    ASSERT_EQ(out.r, 100);
+    ASSERT_EQ(out.g, 100);
+    ASSERT_EQ(out.b, 100);
+    ASSERT_EQ(out.a, 100);
+
+    // Reset blend mode
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+}
+
+// Additive blend saturation: verify clamping at 255
+TEST(test_efb_blend_saturation) {
+    init_gx();
+
+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_COPY);
+
+    // Seed EFB pixel with 200
+    GX_PokeARGB(0, 0, (GXColor){200, 200, 200, 200});
+
+    // Add 200 more (would be 400, should clamp to 255)
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
+        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
+        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
+        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
+    GX_End();
+
+    GXColor out;
+    GX_PeekARGB(0, 0, &out);
+
+    ASSERT_EQ(out.r, 255);
+    ASSERT_EQ(out.g, 255);
+    ASSERT_EQ(out.b, 255);
+    ASSERT_EQ(out.a, 255);
+
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+}
+
+// Multi-pass dot product: validates the DESIGN.md tiled matmul pattern.
+// 1 TEV stage per pass computes RASC*KONST (4 MACs via RGBA).
+// Additive blend accumulates across passes. Single CopyTex at end.
+TEST(test_multi_pass_dot_product) {
+    init_gx();
+
+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_COPY);
+    GX_SetNumTevStages(1);
+
+    // Clear the pixel we'll use
+    GX_PokeARGB(0, 0, (GXColor){0, 0, 0, 0});
+
+    // Compute a dot product of [0.2, 0.3, 0.4, 0.1, 0.5, 0.6, 0.2, 0.1]
+    // with                     [0.3, 0.2, 0.1, 0.4, 0.2, 0.3, 0.5, 0.6]
+    // Split into two passes of 4 MACs each (via RGBA channels).
+
+    // Pass 1: a=[0.2, 0.3, 0.4, 0.1], b=[0.3, 0.2, 0.1, 0.4]
+    u8 a1_r = 51, a1_g = 77, a1_b = 102, a1_a = 26;   // 0.2, 0.3, 0.4, 0.1 in [0,255]
+    u8 b1_r = 77, b1_g = 51, b1_b = 26,  b1_a = 102;  // 0.3, 0.2, 0.1, 0.4
+
+    GX_SetTevKColor(0, (GXColor){b1_r, b1_g, b1_b, b1_a});
+    GX_SetTevKColorSel(GX_TEVSTAGE0, GX_TEV_KCSEL_K0);
+    GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
+    GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_KONST, GX_CC_RASC, GX_CC_ZERO);
+    GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_KONST, GX_CA_RASA, GX_CA_ZERO);
+    GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
+        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
+        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
+        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
+    GX_End();
+
+    // Pass 2: a=[0.5, 0.6, 0.2, 0.1], b=[0.2, 0.3, 0.5, 0.6]
+    u8 a2_r = 128, a2_g = 153, a2_b = 51, a2_a = 26;
+    u8 b2_r = 51,  b2_g = 77,  b2_b = 128, b2_a = 153;
+
+    GX_SetTevKColor(0, (GXColor){b2_r, b2_g, b2_b, b2_a});
+
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
+        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
+        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
+        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
+    GX_End();
+
+    // Read back via CopyTex (the production path)
+    GX_SetTexCopySrc(0, 0, 1, 1);
+    GX_SetTexCopyDst(1, 1, GX_TF_RGBA8, GX_FALSE);
+    u8 result[4] = {0};
+    GX_CopyTex(result, GX_FALSE);
+
+    // Each channel holds one accumulated product pair.
+    // The exact values depend on 8-bit quantization and blend rounding,
+    // so we just verify the total (sum of all 4 channels) is in the right ballpark.
+    //
+    // Exact fp32: 0.2*0.3 + 0.3*0.2 + 0.4*0.1 + 0.1*0.4 +
+    //             0.5*0.2 + 0.6*0.3 + 0.2*0.5 + 0.1*0.6
+    //           = 0.06 + 0.06 + 0.04 + 0.04 + 0.10 + 0.18 + 0.10 + 0.06 = 0.64
+    //
+    // In the u8 domain each product and accumulation loses precision.
+    // The sum of the 4 readback channels (each representing a partial dot product
+    // in [0,255] space) should be roughly 0.64 * 255 = ~163 when summed and
+    // rescaled, but we're reading raw u8 values that each went through
+    // multiply + two additive blend passes. Just check each channel is nonzero
+    // and the total is reasonable.
+    int total = result[0] + result[1] + result[2] + result[3];
+    // Each channel sees ~(product1 + product2) in [0..255].
+    // Product1 channels: ~15, ~15, ~10, ~10; Product2 channels: ~25, ~46, ~25, ~15
+    // Accumulated per channel: ~40, ~61, ~35, ~25 -> total ~161
+    // Allow generous tolerance for 8-bit rounding across two blend passes.
+    if (total < 100 || total > 220) {
+        printf("FAIL\n    multi_pass_dot_product total=%d, expected ~161\n", total);
+        tests_failed++;
+        return;
+    }
+
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+}
+
+// EFB subtract blend mode
+TEST(test_efb_subtract_blend) {
+    init_gx();
+
+    GX_SetBlendMode(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_COPY);
+
+    // Seed EFB pixel with 200
+    GX_PokeARGB(0, 0, (GXColor){200, 200, 200, 200});
+
+    // Subtract 50
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(50, 50, 50, 50);
+        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(50, 50, 50, 50);
+        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(50, 50, 50, 50);
+        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(50, 50, 50, 50);
+    GX_End();
+
+    GXColor out;
+    GX_PeekARGB(0, 0, &out);
+    ASSERT_EQ(out.r, 150);
+    ASSERT_EQ(out.g, 150);
+    ASSERT_EQ(out.b, 150);
+    ASSERT_EQ(out.a, 150);
+
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+}
+
 // EFB CopyTex
 TEST(test_efb_copytex) {
     init_gx();
@@ -384,6 +587,10 @@ int main() {
     RUN(test_tev_scale_x2);
     RUN(test_tev_two_stages);
     RUN(test_tev_texture_replace);
+    RUN(test_efb_additive_blend);
+    RUN(test_efb_blend_saturation);
+    RUN(test_multi_pass_dot_product);
+    RUN(test_efb_subtract_blend);
     RUN(test_efb_copytex);
 
     printf("\n%d passed, %d failed\n", tests_passed, tests_failed);

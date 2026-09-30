@@ -44,6 +44,7 @@ typedef struct _GXFifoObj GXFifoObj;
 
 // Vertex attributes
 #define GX_VA_POS     9
+#define GX_VA_NRM    10
 #define GX_VA_CLR0   11
 #define GX_VA_CLR1   12
 #define GX_VA_TEX0   13
@@ -265,6 +266,36 @@ typedef struct _GXFifoObj GXFifoObj;
 #define GX_BM_LOGIC    2
 #define GX_BM_SUBTRACT 3
 
+// Blend source/destination factors
+#define GX_BL_ZERO        0
+#define GX_BL_ONE         1
+#define GX_BL_SRCCLR      2   // dst factor only
+#define GX_BL_INVSRCCLR   3   // dst factor only
+#define GX_BL_SRCALPHA    4
+#define GX_BL_INVSRCALPHA 5
+#define GX_BL_DSTALPHA    6
+#define GX_BL_INVDSTALPHA 7
+#define GX_BL_DSTCLR      2   // src factor only (same encoding as SRCCLR)
+#define GX_BL_INVDSTCLR   3   // src factor only (same encoding as INVSRCCLR)
+
+// Logic ops (for GX_BM_LOGIC)
+#define GX_LO_CLEAR   0
+#define GX_LO_AND     1
+#define GX_LO_REVAND  2
+#define GX_LO_COPY    3
+#define GX_LO_INVAND  4
+#define GX_LO_NOOP    5
+#define GX_LO_XOR     6
+#define GX_LO_OR      7
+#define GX_LO_NOR     8
+#define GX_LO_EQUIV   9
+#define GX_LO_INV    10
+#define GX_LO_REVOR  11
+#define GX_LO_INVCOPY 12
+#define GX_LO_INVOR  13
+#define GX_LO_NAND   14
+#define GX_LO_SET    15
+
 // Compare functions
 #define GX_NEVER   0
 #define GX_LESS    1
@@ -293,9 +324,79 @@ typedef struct _GXFifoObj GXFifoObj;
 #define GX_TG_TEX2 6
 #define GX_TG_TEX3 7
 
-// Texture matrix slots
+// Texture matrix slots (XF memory offsets, spaced by 3 for 4x3 matrices)
 #define GX_TEXMTX0    30
+#define GX_TEXMTX1    33
+#define GX_TEXMTX2    36
+#define GX_TEXMTX3    39
+#define GX_TEXMTX4    42
+#define GX_TEXMTX5    45
+#define GX_TEXMTX6    48
+#define GX_TEXMTX7    51
+#define GX_TEXMTX8    54
+#define GX_TEXMTX9    57
 #define GX_IDENTITY   60
+
+// Position/normal matrix slots
+#define GX_PNMTX0     0
+#define GX_PNMTX1     3
+#define GX_PNMTX2     6
+#define GX_PNMTX3     9
+
+// Indirect texture stages
+#define GX_INDTEXSTAGE0  0
+#define GX_INDTEXSTAGE1  1
+#define GX_INDTEXSTAGE2  2
+#define GX_INDTEXSTAGE3  3
+#define GX_MAX_INDTEXSTAGE 4
+
+// Indirect texture format
+#define GX_ITF_8   0
+#define GX_ITF_5   1
+#define GX_ITF_4   2
+#define GX_ITF_3   3
+
+// Indirect texture bias
+#define GX_ITB_NONE  0
+#define GX_ITB_S     1
+#define GX_ITB_T     2
+#define GX_ITB_ST    3
+#define GX_ITB_U     4
+#define GX_ITB_SU    5
+#define GX_ITB_TU    6
+#define GX_ITB_STU   7
+
+// Indirect texture matrix selection
+#define GX_ITM_OFF   0
+#define GX_ITM_0     1
+#define GX_ITM_1     2
+#define GX_ITM_2     3
+
+// Indirect texture wrap
+#define GX_ITW_OFF   0
+#define GX_ITW_256   1
+#define GX_ITW_128   2
+#define GX_ITW_64    3
+#define GX_ITW_32    4
+#define GX_ITW_16    5
+#define GX_ITW_0     6
+
+// Indirect texture alpha bump
+#define GX_ITBA_OFF  0
+#define GX_ITBA_S    1
+#define GX_ITBA_T    2
+#define GX_ITBA_U    3
+
+// Indirect texture scale
+#define GX_ITS_1     0
+#define GX_ITS_2     1
+#define GX_ITS_4     2
+#define GX_ITS_8     3
+#define GX_ITS_16    4
+#define GX_ITS_32    5
+#define GX_ITS_64    6
+#define GX_ITS_128   7
+#define GX_ITS_256   8
 
 // Boolean
 #define GX_TRUE  1

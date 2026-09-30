@@ -1,6 +1,7 @@
 // GX Software Simulator
 // Implements the subset of libogc's GX API needed for compute-via-TEV.
-// Focuses on: TEV combiner pipeline, EFB read/write, texture sampling,
+// Covers: TEV combiner pipeline, EFB read/write with blending, texture sampling,
+// indirect texture coordinate manipulation, XF texgen matrix transforms,
 // and full-screen quad rasterization.
 
 #include "gx.h"
@@ -18,6 +19,11 @@ static const int MAX_TEXMAPS = 8;
 static const int MAX_KONST_COLORS = 4;
 static const int MAX_TEV_REGS = 4;   // TEVPREV + TEVREG0..2
 static const int MAX_SWAP_TABLES = 4;
+static const int MAX_TEXGENS = 8;
+static const int MAX_TEXMTX = 10;
+static const int MAX_PNMTX = 10;
+static const int MAX_IND_STAGES = 4;
+static const int MAX_IND_MTX = 3;
 
 struct TEVStageConfig {
     // Color inputs (a, b, c, d selectors)
@@ -36,6 +42,16 @@ struct TEVStageConfig {
     u8 kcsel, kasel;
     // Swap mode selectors
     u8 ras_swap, tex_swap;
+    // Indirect texture config
+    u8 ind_stage;
+    u8 ind_format;
+    u8 ind_bias_sel;
+    u8 ind_matrix_sel;
+    u8 ind_wrap_s, ind_wrap_t;
+    u8 ind_add_prev;
+    u8 ind_utc_lod;
+    u8 ind_alpha_sel;
+    bool ind_enable;
 };
 
 struct SwapTable {
@@ -66,11 +82,53 @@ struct TexCopyRegion {
 
 struct VertexData {
     f32 pos[3];
+    f32 normal[3];
     u8 color[4];
     f32 texcoord[8][2];  // up to 8 texcoord slots
     bool has_pos;
+    bool has_normal;
     bool has_color;
     bool has_texcoord[8];
+};
+
+struct TexGenConfig {
+    u32 tgen_type;  // GX_TG_MTX2x4 or GX_TG_MTX3x4
+    u32 tgen_src;   // GX_TG_POS, GX_TG_NRM, GX_TG_TEX0..7
+    u32 mtx_src;    // GX_TEXMTX0..9 or GX_IDENTITY
+    bool active;
+};
+
+// 4x3 matrix stored as float[3][4] (3 rows, 4 columns) matching libogc Mtx format
+// For a 2x4 texgen, only rows 0-1 are used, producing 2 output components (s, t).
+// For a 3x4 texgen, rows 0-2 produce 3 components (s, t, q).
+struct TexMatrix {
+    f32 m[3][4];
+    bool loaded;
+};
+
+struct PosNrmMatrix {
+    f32 m[3][4];
+    bool loaded;
+};
+
+struct BlendState {
+    u8 mode;       // GX_BM_NONE, GX_BM_BLEND, GX_BM_LOGIC, GX_BM_SUBTRACT
+    u8 src_factor; // GX_BL_*
+    u8 dst_factor; // GX_BL_*
+    u8 logic_op;   // GX_LO_*
+};
+
+struct IndTexStageConfig {
+    u8 texcoord;
+    u8 texmap;
+    u8 scale_s;
+    u8 scale_t;
+};
+
+struct IndTexMatrix {
+    f32 m[2][3];   // 2x3 offset matrix
+    s8 scale_exp;  // power-of-2 scale exponent
+    bool loaded;
 };
 
 // Global simulator state
@@ -105,6 +163,7 @@ static struct {
 
     // Vertex attribute state
     bool vtx_has_pos;
+    bool vtx_has_normal;
     bool vtx_has_color;
     bool vtx_has_texcoord[8];
 
@@ -112,9 +171,25 @@ static struct {
     bool color_update_enabled;
     bool alpha_update_enabled;
 
-    // Number of texcoord gens
+    // Texgen
     u32 num_texgens;
+    TexGenConfig texgens[MAX_TEXGENS];
+
+    // XF matrices
+    TexMatrix tex_matrices[MAX_TEXMTX];
+    PosNrmMatrix pn_matrices[MAX_PNMTX];
+    u32 current_pnmtx;
+
+    // Color channels
     u8 num_color_chans;
+
+    // Blend state
+    BlendState blend;
+
+    // Indirect texture
+    u8 num_ind_stages;
+    IndTexStageConfig ind_stages[MAX_IND_STAGES];
+    IndTexMatrix ind_matrices[MAX_IND_MTX];
 
     // Initialized flag
     bool initialized;
@@ -362,6 +437,205 @@ static s16 tev_combine(s16 a, s16 b, s16 c, s16 d,
     return (s16)result;
 }
 
+// Resolve a blend factor to a multiplier in [0..255] range for one channel.
+// src_val is the fragment (source) value, dst_val is the existing EFB value.
+static u8 resolve_blend_factor(u8 factor, u8 src_r, u8 src_g, u8 src_b, u8 src_a,
+                               u8 dst_r, u8 dst_g, u8 dst_b, u8 dst_a,
+                               int channel) {
+    // channel: 0=R, 1=G, 2=B, 3=A
+    u8 src_ch[4] = {src_r, src_g, src_b, src_a};
+    u8 dst_ch[4] = {dst_r, dst_g, dst_b, dst_a};
+    switch (factor) {
+        case GX_BL_ZERO:        return 0;
+        case GX_BL_ONE:         return 255;
+        // GX_BL_SRCCLR / GX_BL_DSTCLR share the same encoding (2)
+        // Context determines meaning: as dst_factor it's SRCCLR, as src_factor it's DSTCLR
+        // We handle both the same way since the caller passes the right value.
+        case GX_BL_SRCCLR:      return src_ch[channel];  // also GX_BL_DSTCLR
+        case GX_BL_INVSRCCLR:   return 255 - src_ch[channel]; // also GX_BL_INVDSTCLR
+        case GX_BL_SRCALPHA:    return src_a;
+        case GX_BL_INVSRCALPHA: return 255 - src_a;
+        case GX_BL_DSTALPHA:    return dst_a;
+        case GX_BL_INVDSTALPHA: return 255 - dst_a;
+        default:                return 255;
+    }
+}
+
+// Apply EFB blending. fragment is the TEV output (clamped to 0..255).
+// Reads the existing EFB pixel, applies blend, writes back.
+static void blend_and_write(int px, int py, u8 frag_r, u8 frag_g, u8 frag_b, u8 frag_a) {
+    if (px < 0 || px >= GX_EFB_WIDTH || py < 0 || py >= GX_EFB_HEIGHT) return;
+
+    EFBPixel& pixel = gx.efb[py][px];
+
+    if (gx.blend.mode == GX_BM_NONE) {
+        // No blending: overwrite
+        if (gx.color_update_enabled) {
+            pixel.r = frag_r;
+            pixel.g = frag_g;
+            pixel.b = frag_b;
+        }
+        if (gx.alpha_update_enabled) {
+            pixel.a = frag_a;
+        }
+        return;
+    }
+
+    u8 dst_r = clamp_u8(pixel.r);
+    u8 dst_g = clamp_u8(pixel.g);
+    u8 dst_b = clamp_u8(pixel.b);
+    u8 dst_a = clamp_u8(pixel.a);
+
+    if (gx.blend.mode == GX_BM_BLEND) {
+        // out = src * src_factor + dst * dst_factor, per channel, clamped to [0, 255]
+        for (int ch = 0; ch < 4; ch++) {
+            bool update = (ch < 3) ? gx.color_update_enabled : gx.alpha_update_enabled;
+            if (!update) continue;
+
+            u8 src_val = (ch == 0) ? frag_r : (ch == 1) ? frag_g : (ch == 2) ? frag_b : frag_a;
+            u8 dst_val = (ch == 0) ? dst_r : (ch == 1) ? dst_g : (ch == 2) ? dst_b : dst_a;
+
+            u8 sf = resolve_blend_factor(gx.blend.src_factor,
+                                         frag_r, frag_g, frag_b, frag_a,
+                                         dst_r, dst_g, dst_b, dst_a, ch);
+            u8 df = resolve_blend_factor(gx.blend.dst_factor,
+                                         frag_r, frag_g, frag_b, frag_a,
+                                         dst_r, dst_g, dst_b, dst_a, ch);
+
+            // Fixed-point multiply: (val * factor + 128) >> 8
+            s32 blended = ((s32)src_val * sf + 128) / 256 + ((s32)dst_val * df + 128) / 256;
+            if (blended < 0) blended = 0;
+            if (blended > 255) blended = 255;
+
+            s16* dest = (ch == 0) ? &pixel.r : (ch == 1) ? &pixel.g : (ch == 2) ? &pixel.b : &pixel.a;
+            *dest = (s16)blended;
+        }
+        return;
+    }
+
+    if (gx.blend.mode == GX_BM_SUBTRACT) {
+        // out = dst - src, clamped to [0, 255]
+        if (gx.color_update_enabled) {
+            pixel.r = (s16)std::max(0, (int)dst_r - (int)frag_r);
+            pixel.g = (s16)std::max(0, (int)dst_g - (int)frag_g);
+            pixel.b = (s16)std::max(0, (int)dst_b - (int)frag_b);
+        }
+        if (gx.alpha_update_enabled) {
+            pixel.a = (s16)std::max(0, (int)dst_a - (int)frag_a);
+        }
+        return;
+    }
+
+    if (gx.blend.mode == GX_BM_LOGIC) {
+        // Logic ops applied per byte
+        auto apply_logic = [](u8 src, u8 dst, u8 op) -> u8 {
+            switch (op) {
+                case GX_LO_CLEAR:  return 0;
+                case GX_LO_AND:    return src & dst;
+                case GX_LO_REVAND: return src & ~dst;
+                case GX_LO_COPY:   return src;
+                case GX_LO_INVAND: return ~src & dst;
+                case GX_LO_NOOP:   return dst;
+                case GX_LO_XOR:    return src ^ dst;
+                case GX_LO_OR:     return src | dst;
+                case GX_LO_NOR:    return ~(src | dst);
+                case GX_LO_EQUIV:  return ~(src ^ dst);
+                case GX_LO_INV:    return ~dst;
+                case GX_LO_REVOR:  return src | ~dst;
+                case GX_LO_INVCOPY: return ~src;
+                case GX_LO_INVOR:  return ~src | dst;
+                case GX_LO_NAND:   return ~(src & dst);
+                case GX_LO_SET:    return 0xFF;
+                default:           return src;
+            }
+        };
+        if (gx.color_update_enabled) {
+            pixel.r = apply_logic(frag_r, dst_r, gx.blend.logic_op);
+            pixel.g = apply_logic(frag_g, dst_g, gx.blend.logic_op);
+            pixel.b = apply_logic(frag_b, dst_b, gx.blend.logic_op);
+        }
+        if (gx.alpha_update_enabled) {
+            pixel.a = apply_logic(frag_a, dst_a, gx.blend.logic_op);
+        }
+        return;
+    }
+
+    // Unknown mode: overwrite
+    if (gx.color_update_enabled) {
+        pixel.r = frag_r;
+        pixel.g = frag_g;
+        pixel.b = frag_b;
+    }
+    if (gx.alpha_update_enabled) {
+        pixel.a = frag_a;
+    }
+}
+
+// Apply indirect texture coordinate offset for a TEV stage.
+// Modifies the texture coordinates in-place before the main texture fetch.
+static void apply_indirect_texcoord(const TEVStageConfig& cfg,
+                                    const f32 texcoords[8][2],
+                                    f32* out_s, f32* out_t) {
+    if (!cfg.ind_enable) {
+        *out_s = texcoords[cfg.texcoord][0];
+        *out_t = texcoords[cfg.texcoord][1];
+        return;
+    }
+
+    const IndTexStageConfig& ist = gx.ind_stages[cfg.ind_stage];
+
+    // Sample the indirect texture
+    u8 ind_texel[4] = {0, 0, 0, 0};
+    if (ist.texmap < MAX_TEXMAPS) {
+        f32 ind_s = texcoords[ist.texcoord][0];
+        f32 ind_t = texcoords[ist.texcoord][1];
+        sample_texture(ist.texmap, ind_s, ind_t, ind_texel);
+    }
+
+    // Extract offset components based on format (number of bits to use)
+    // GX_ITF_8: full 8-bit, GX_ITF_5: top 5 bits, etc.
+    s32 ind_offset[3]; // S, T, U components
+    int shift = 0;
+    switch (cfg.ind_format) {
+        case GX_ITF_8: shift = 0; break;
+        case GX_ITF_5: shift = 3; break;
+        case GX_ITF_4: shift = 4; break;
+        case GX_ITF_3: shift = 5; break;
+    }
+    // Convert unsigned texel values to signed offsets (centered at 128)
+    ind_offset[0] = ((s32)ind_texel[0] >> shift) - (128 >> shift);
+    ind_offset[1] = ((s32)ind_texel[1] >> shift) - (128 >> shift);
+    ind_offset[2] = ((s32)ind_texel[2] >> shift) - (128 >> shift);
+
+    // Apply bias
+    if (!(cfg.ind_bias_sel & 1)) ind_offset[0] = 0; // S bias disabled
+    if (!(cfg.ind_bias_sel & 2)) ind_offset[1] = 0; // T bias disabled
+    if (!(cfg.ind_bias_sel & 4)) ind_offset[2] = 0; // U bias disabled
+
+    f32 coord_s = texcoords[cfg.texcoord][0];
+    f32 coord_t = texcoords[cfg.texcoord][1];
+
+    // Apply indirect matrix transform if selected
+    if (cfg.ind_matrix_sel >= GX_ITM_0 && cfg.ind_matrix_sel <= GX_ITM_2) {
+        int mtx_idx = cfg.ind_matrix_sel - GX_ITM_0;
+        if (mtx_idx < MAX_IND_MTX && gx.ind_matrices[mtx_idx].loaded) {
+            const IndTexMatrix& mtx = gx.ind_matrices[mtx_idx];
+            f32 scale = ldexpf(1.0f, mtx.scale_exp);
+            f32 offs_s = (mtx.m[0][0] * ind_offset[0] +
+                          mtx.m[0][1] * ind_offset[1] +
+                          mtx.m[0][2] * ind_offset[2]) * scale;
+            f32 offs_t = (mtx.m[1][0] * ind_offset[0] +
+                          mtx.m[1][1] * ind_offset[1] +
+                          mtx.m[1][2] * ind_offset[2]) * scale;
+            coord_s += offs_s;
+            coord_t += offs_t;
+        }
+    }
+
+    *out_s = coord_s;
+    *out_t = coord_t;
+}
+
 // Process a single fragment through the TEV pipeline
 static void process_fragment(int px, int py,
                              const u8 ras_color_raw[4],
@@ -378,11 +652,11 @@ static void process_fragment(int px, int py,
     for (int stage = 0; stage < gx.num_tev_stages; stage++) {
         const TEVStageConfig& cfg = gx.tev_stages[stage];
 
-        // Sample texture for this stage
+        // Sample texture for this stage (with optional indirect texcoord offset)
         u8 tex_color_raw[4] = {0, 0, 0, 0};
         if (cfg.texmap != GX_TEXMAP_NULL && cfg.texcoord != GX_TEXCOORDNULL) {
-            f32 s = texcoords[cfg.texcoord][0];
-            f32 t = texcoords[cfg.texcoord][1];
+            f32 s, t;
+            apply_indirect_texcoord(cfg, texcoords, &s, &t);
             sample_texture((u8)cfg.texmap, s, t, tex_color_raw);
         }
 
@@ -423,17 +697,88 @@ static void process_fragment(int px, int py,
         }
     }
 
-    // Write to EFB (TEVPREV is the final output)
-    if (px >= 0 && px < GX_EFB_WIDTH && py >= 0 && py < GX_EFB_HEIGHT) {
-        EFBPixel& pixel = gx.efb[py][px];
-        if (gx.color_update_enabled) {
-            pixel.r = tev_regs[GX_TEVPREV][0];
-            pixel.g = tev_regs[GX_TEVPREV][1];
-            pixel.b = tev_regs[GX_TEVPREV][2];
+    // Write to EFB through the blend unit (TEVPREV is the final output)
+    u8 frag_r = clamp_u8(tev_regs[GX_TEVPREV][0]);
+    u8 frag_g = clamp_u8(tev_regs[GX_TEVPREV][1]);
+    u8 frag_b = clamp_u8(tev_regs[GX_TEVPREV][2]);
+    u8 frag_a = clamp_u8(tev_regs[GX_TEVPREV][3]);
+
+    blend_and_write(px, py, frag_r, frag_g, frag_b, frag_a);
+}
+
+// Convert a texgen matrix slot ID (GX_TEXMTX0..GX_TEXMTX9, GX_IDENTITY) to
+// an index into our tex_matrices array. Returns -1 for GX_IDENTITY.
+static int texmtx_to_index(u32 mtxsrc) {
+    if (mtxsrc == GX_IDENTITY) return -1;
+    if (mtxsrc >= GX_TEXMTX0 && mtxsrc <= GX_TEXMTX9) {
+        return (mtxsrc - GX_TEXMTX0) / 3;
+    }
+    return -1;
+}
+
+// Apply XF texgen transforms to a vertex's attributes, producing the
+// per-vertex texture coordinates that will be interpolated by the rasterizer.
+static void apply_texgens(const VertexData& vtx, f32 out_texcoords[8][2]) {
+    for (u32 tg = 0; tg < gx.num_texgens && tg < MAX_TEXGENS; tg++) {
+        const TexGenConfig& gen = gx.texgens[tg];
+        if (!gen.active) {
+            // Use vertex-submitted texcoords as-is
+            out_texcoords[tg][0] = vtx.has_texcoord[tg] ? vtx.texcoord[tg][0] : 0.0f;
+            out_texcoords[tg][1] = vtx.has_texcoord[tg] ? vtx.texcoord[tg][1] : 0.0f;
+            continue;
         }
-        if (gx.alpha_update_enabled) {
-            pixel.a = tev_regs[GX_TEVPREV][3];
+
+        // Determine input vector based on tgen_src
+        f32 input[4] = {0, 0, 0, 1}; // x, y, z, w=1
+        switch (gen.tgen_src) {
+            case GX_TG_POS:
+                input[0] = vtx.pos[0];
+                input[1] = vtx.pos[1];
+                input[2] = vtx.pos[2];
+                break;
+            case GX_TG_NRM:
+                input[0] = vtx.normal[0];
+                input[1] = vtx.normal[1];
+                input[2] = vtx.normal[2];
+                break;
+            default:
+                // GX_TG_TEX0..GX_TG_TEX7
+                if (gen.tgen_src >= GX_TG_TEX0 && gen.tgen_src <= GX_TG_TEX3) {
+                    int ti = gen.tgen_src - GX_TG_TEX0;
+                    if (vtx.has_texcoord[ti]) {
+                        input[0] = vtx.texcoord[ti][0];
+                        input[1] = vtx.texcoord[ti][1];
+                    }
+                    input[2] = 1.0f;
+                }
+                break;
         }
+
+        int mtx_idx = texmtx_to_index(gen.mtx_src);
+        if (mtx_idx < 0 || !gx.tex_matrices[mtx_idx].loaded) {
+            // Identity: pass through input as texcoords
+            out_texcoords[tg][0] = input[0];
+            out_texcoords[tg][1] = input[1];
+        } else {
+            // Matrix * input vector
+            const f32 (*m)[4] = gx.tex_matrices[mtx_idx].m;
+            if (gen.tgen_type == GX_TG_MTX2x4) {
+                // 2x4 matrix: 2 output components (s, t)
+                out_texcoords[tg][0] = m[0][0]*input[0] + m[0][1]*input[1] + m[0][2]*input[2] + m[0][3]*input[3];
+                out_texcoords[tg][1] = m[1][0]*input[0] + m[1][1]*input[1] + m[1][2]*input[2] + m[1][3]*input[3];
+            } else {
+                // 3x4 matrix: 3 output components (s, t, q). We store s, t.
+                // q could be used for perspective correction, not modeled here.
+                out_texcoords[tg][0] = m[0][0]*input[0] + m[0][1]*input[1] + m[0][2]*input[2] + m[0][3]*input[3];
+                out_texcoords[tg][1] = m[1][0]*input[0] + m[1][1]*input[1] + m[1][2]*input[2] + m[1][3]*input[3];
+            }
+        }
+    }
+
+    // For any remaining texcoord slots beyond num_texgens, pass through vertex data
+    for (u32 tg = gx.num_texgens; tg < 8; tg++) {
+        out_texcoords[tg][0] = vtx.has_texcoord[tg] ? vtx.texcoord[tg][0] : 0.0f;
+        out_texcoords[tg][1] = vtx.has_texcoord[tg] ? vtx.texcoord[tg][1] : 0.0f;
     }
 }
 
@@ -459,30 +804,31 @@ static void rasterize_quad(const VertexData verts[4]) {
     if (width < 0.001f) width = 0.001f;
     if (height < 0.001f) height = 0.001f;
 
+    // Pre-compute texgen outputs for each corner vertex
+    f32 corner_tc[4][8][2];
+    for (int v = 0; v < 4; v++) {
+        apply_texgens(verts[v], corner_tc[v]);
+    }
+
     for (int py = iy0; py <= iy1; py++) {
         for (int px = ix0; px <= ix1; px++) {
-            // Compute normalized position within the quad for texcoord interpolation
+            // Compute normalized position within the quad for interpolation
             f32 u = (px - min_x) / width;
             f32 v = (py - min_y) / height;
             u = std::max(0.0f, std::min(1.0f, u));
             v = std::max(0.0f, std::min(1.0f, v));
 
             // Interpolate texcoords (bilinear between the 4 corners)
-            // Assuming vertex order: 0=TL, 1=TR, 2=BR, 3=BL (or similar quad ordering)
+            // Vertex order: 0=TL, 1=TR, 2=BR, 3=BL
             f32 texcoords[8][2];
             for (int t = 0; t < 8; t++) {
-                if (verts[0].has_texcoord[t]) {
-                    f32 top = verts[0].texcoord[t][0] * (1 - u) + verts[1].texcoord[t][0] * u;
-                    f32 bot = verts[3].texcoord[t][0] * (1 - u) + verts[2].texcoord[t][0] * u;
-                    texcoords[t][0] = top * (1 - v) + bot * v;
+                f32 top_s = corner_tc[0][t][0] * (1 - u) + corner_tc[1][t][0] * u;
+                f32 bot_s = corner_tc[3][t][0] * (1 - u) + corner_tc[2][t][0] * u;
+                texcoords[t][0] = top_s * (1 - v) + bot_s * v;
 
-                    top = verts[0].texcoord[t][1] * (1 - u) + verts[1].texcoord[t][1] * u;
-                    bot = verts[3].texcoord[t][1] * (1 - u) + verts[2].texcoord[t][1] * u;
-                    texcoords[t][1] = top * (1 - v) + bot * v;
-                } else {
-                    texcoords[t][0] = u;
-                    texcoords[t][1] = v;
-                }
+                f32 top_t = corner_tc[0][t][1] * (1 - u) + corner_tc[1][t][1] * u;
+                f32 bot_t = corner_tc[3][t][1] * (1 - u) + corner_tc[2][t][1] * u;
+                texcoords[t][1] = top_t * (1 - v) + bot_t * v;
             }
 
             // Interpolate vertex color
@@ -521,6 +867,45 @@ static void flush_vertices() {
     gx.vertex_buffer.clear();
 }
 
+// Default-initialize a TEV stage config
+static void init_tev_stage(TEVStageConfig& s) {
+    s.color_a = GX_CC_ZERO;
+    s.color_b = GX_CC_ZERO;
+    s.color_c = GX_CC_ZERO;
+    s.color_d = GX_CC_RASC;
+    s.alpha_a = GX_CA_ZERO;
+    s.alpha_b = GX_CA_ZERO;
+    s.alpha_c = GX_CA_ZERO;
+    s.alpha_d = GX_CA_RASA;
+    s.color_op = GX_TEV_ADD;
+    s.alpha_op = GX_TEV_ADD;
+    s.color_bias = GX_TB_ZERO;
+    s.alpha_bias = GX_TB_ZERO;
+    s.color_scale = GX_CS_SCALE_1;
+    s.alpha_scale = GX_CS_SCALE_1;
+    s.color_clamp = 1;
+    s.alpha_clamp = 1;
+    s.color_regid = GX_TEVPREV;
+    s.alpha_regid = GX_TEVPREV;
+    s.texcoord = GX_TEXCOORDNULL;
+    s.texmap = GX_TEXMAP_NULL;
+    s.colorchan = GX_COLOR0A0;
+    s.kcsel = GX_TEV_KCSEL_1;
+    s.kasel = GX_TEV_KASEL_1;
+    s.ras_swap = 0;
+    s.tex_swap = 0;
+    s.ind_stage = 0;
+    s.ind_format = GX_ITF_8;
+    s.ind_bias_sel = GX_ITB_NONE;
+    s.ind_matrix_sel = GX_ITM_OFF;
+    s.ind_wrap_s = GX_ITW_OFF;
+    s.ind_wrap_t = GX_ITW_OFF;
+    s.ind_add_prev = 0;
+    s.ind_utc_lod = 0;
+    s.ind_alpha_sel = GX_ITBA_OFF;
+    s.ind_enable = false;
+}
+
 // Public API implementation
 
 GXFifoObj* GX_Init(void* base, u32 size) {
@@ -528,32 +913,7 @@ GXFifoObj* GX_Init(void* base, u32 size) {
 
     // Default TEV stage config (pass through rasterized color)
     for (int i = 0; i < MAX_TEV_STAGES; i++) {
-        TEVStageConfig& s = gx.tev_stages[i];
-        s.color_a = GX_CC_ZERO;
-        s.color_b = GX_CC_ZERO;
-        s.color_c = GX_CC_ZERO;
-        s.color_d = GX_CC_RASC;
-        s.alpha_a = GX_CA_ZERO;
-        s.alpha_b = GX_CA_ZERO;
-        s.alpha_c = GX_CA_ZERO;
-        s.alpha_d = GX_CA_RASA;
-        s.color_op = GX_TEV_ADD;
-        s.alpha_op = GX_TEV_ADD;
-        s.color_bias = GX_TB_ZERO;
-        s.alpha_bias = GX_TB_ZERO;
-        s.color_scale = GX_CS_SCALE_1;
-        s.alpha_scale = GX_CS_SCALE_1;
-        s.color_clamp = 1;
-        s.alpha_clamp = 1;
-        s.color_regid = GX_TEVPREV;
-        s.alpha_regid = GX_TEVPREV;
-        s.texcoord = GX_TEXCOORDNULL;
-        s.texmap = GX_TEXMAP_NULL;
-        s.colorchan = GX_COLOR0A0;
-        s.kcsel = GX_TEV_KCSEL_1;
-        s.kasel = GX_TEV_KASEL_1;
-        s.ras_swap = 0;
-        s.tex_swap = 0;
+        init_tev_stage(gx.tev_stages[i]);
     }
     gx.num_tev_stages = 1;
 
@@ -566,6 +926,33 @@ GXFifoObj* GX_Init(void* base, u32 size) {
     gx.alpha_update_enabled = true;
     gx.num_texgens = 0;
     gx.num_color_chans = 1;
+
+    // Default blend: none (overwrite)
+    gx.blend.mode = GX_BM_NONE;
+    gx.blend.src_factor = GX_BL_ONE;
+    gx.blend.dst_factor = GX_BL_ZERO;
+    gx.blend.logic_op = GX_LO_COPY;
+
+    // Clear XF state
+    for (int i = 0; i < MAX_TEXGENS; i++) {
+        gx.texgens[i].active = false;
+    }
+    for (int i = 0; i < MAX_TEXMTX; i++) {
+        gx.tex_matrices[i].loaded = false;
+    }
+    for (int i = 0; i < MAX_PNMTX; i++) {
+        gx.pn_matrices[i].loaded = false;
+    }
+    gx.current_pnmtx = 0;
+
+    // Clear indirect texture state
+    gx.num_ind_stages = 0;
+    for (int i = 0; i < MAX_IND_STAGES; i++) {
+        gx.ind_stages[i] = {GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_ITS_1, GX_ITS_1};
+    }
+    for (int i = 0; i < MAX_IND_MTX; i++) {
+        memset(&gx.ind_matrices[i], 0, sizeof(IndTexMatrix));
+    }
 
     // Clear EFB
     for (int y = 0; y < GX_EFB_HEIGHT; y++) {
@@ -593,6 +980,7 @@ void GX_DrawDone(void) {
 
 void GX_ClearVtxDesc(void) {
     gx.vtx_has_pos = false;
+    gx.vtx_has_normal = false;
     gx.vtx_has_color = false;
     for (int i = 0; i < 8; i++) gx.vtx_has_texcoord[i] = false;
 }
@@ -600,6 +988,7 @@ void GX_ClearVtxDesc(void) {
 void GX_SetVtxDesc(u8 attr, u8 type) {
     bool enabled = (type != GX_NONE);
     if (attr == GX_VA_POS) gx.vtx_has_pos = enabled;
+    else if (attr == GX_VA_NRM) gx.vtx_has_normal = enabled;
     else if (attr == GX_VA_CLR0) gx.vtx_has_color = enabled;
     else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7)
         gx.vtx_has_texcoord[attr - GX_VA_TEX0] = enabled;
@@ -731,7 +1120,10 @@ void GX_SetTevSwapModeTable(u8 swapid, u8 r, u8 g, u8 b, u8 a) {
     }
 }
 
-void GX_SetTevDirect(u8) {}
+void GX_SetTevDirect(u8 tevstage) {
+    gx.tev_stages[tevstage].ind_enable = false;
+    gx.tev_stages[tevstage].ind_matrix_sel = GX_ITM_OFF;
+}
 
 void GX_InitTexObj(GXTexObj* obj, void* img_ptr, u16 wd, u16 ht, u8 fmt,
                    u8 wrap_s, u8 wrap_t, u8 mipmap) {
@@ -777,7 +1169,110 @@ u32 GX_GetTexBufferSize(u16 wd, u16 ht, u32 fmt, u8, u8) {
 }
 
 void GX_SetNumTexGens(u32 nr) { gx.num_texgens = nr; }
-void GX_SetTexCoordGen(u16, u32, u32, u32) {}
+
+void GX_SetTexCoordGen(u16 texcoord, u32 tgen_typ, u32 tgen_src, u32 mtxsrc) {
+    if (texcoord < MAX_TEXGENS) {
+        gx.texgens[texcoord].tgen_type = tgen_typ;
+        gx.texgens[texcoord].tgen_src = tgen_src;
+        gx.texgens[texcoord].mtx_src = mtxsrc;
+        gx.texgens[texcoord].active = true;
+    }
+}
+
+void GX_LoadTexMtxImm(const f32 mtx[][4], u32 texmtx, u8 type) {
+    int idx = texmtx_to_index(texmtx);
+    if (idx >= 0 && idx < MAX_TEXMTX) {
+        int rows = (type == GX_TG_MTX2x4) ? 2 : 3;
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < 4; c++) {
+                gx.tex_matrices[idx].m[r][c] = mtx[r][c];
+            }
+        }
+        // Zero remaining rows if 2x4
+        for (int r = rows; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                gx.tex_matrices[idx].m[r][c] = 0.0f;
+            }
+        }
+        gx.tex_matrices[idx].loaded = true;
+    }
+}
+
+void GX_LoadPosMtxImm(const f32 mtx[][4], u32 pnmtx) {
+    int idx = pnmtx / 3;
+    if (idx < MAX_PNMTX) {
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 4; c++) {
+                gx.pn_matrices[idx].m[r][c] = mtx[r][c];
+            }
+        }
+        gx.pn_matrices[idx].loaded = true;
+    }
+}
+
+void GX_LoadNrmMtxImm(const f32 mtx[][4], u32 pnmtx) {
+    // For the sim, normal matrices share the same slots as position matrices.
+    // On real hardware these have separate storage, but we don't transform
+    // normals in the sim currently.
+    GX_LoadPosMtxImm(mtx, pnmtx);
+}
+
+void GX_SetCurrentMtx(u32 pnmtx) {
+    gx.current_pnmtx = pnmtx;
+}
+
+// Indirect texture API
+
+void GX_SetNumIndStages(u8 num) {
+    gx.num_ind_stages = num;
+}
+
+void GX_SetIndTexOrder(u8 ind_stage, u8 texcoord, u8 texmap) {
+    if (ind_stage < MAX_IND_STAGES) {
+        gx.ind_stages[ind_stage].texcoord = texcoord;
+        gx.ind_stages[ind_stage].texmap = texmap;
+    }
+}
+
+void GX_SetIndTexCoordScale(u8 ind_stage, u8 scale_s, u8 scale_t) {
+    if (ind_stage < MAX_IND_STAGES) {
+        gx.ind_stages[ind_stage].scale_s = scale_s;
+        gx.ind_stages[ind_stage].scale_t = scale_t;
+    }
+}
+
+void GX_SetIndTexMtx(u8 ind_mtx, const f32 offset_mtx[2][3], s8 scale_exp) {
+    int idx = ind_mtx - GX_ITM_0;
+    if (idx >= 0 && idx < MAX_IND_MTX) {
+        for (int r = 0; r < 2; r++) {
+            for (int c = 0; c < 3; c++) {
+                gx.ind_matrices[idx].m[r][c] = offset_mtx[r][c];
+            }
+        }
+        gx.ind_matrices[idx].scale_exp = scale_exp;
+        gx.ind_matrices[idx].loaded = true;
+    }
+}
+
+void GX_SetTevIndirect(u8 tevstage, u8 ind_stage, u8 format,
+                        u8 bias_sel, u8 matrix_sel,
+                        u8 wrap_s, u8 wrap_t,
+                        u8 add_prev, u8 utc_lod, u8 alpha_sel) {
+    if (tevstage < MAX_TEV_STAGES) {
+        TEVStageConfig& s = gx.tev_stages[tevstage];
+        s.ind_enable = true;
+        s.ind_stage = ind_stage;
+        s.ind_format = format;
+        s.ind_bias_sel = bias_sel;
+        s.ind_matrix_sel = matrix_sel;
+        s.ind_wrap_s = wrap_s;
+        s.ind_wrap_t = wrap_t;
+        s.ind_add_prev = add_prev;
+        s.ind_utc_lod = utc_lod;
+        s.ind_alpha_sel = alpha_sel;
+    }
+}
+
 void GX_SetNumChans(u8 num) { gx.num_color_chans = num; }
 
 void GX_Begin(u8 primitive, u8 vtxfmt, u16 vtxcnt) {
@@ -851,7 +1346,12 @@ void GX_TexCoord2f32(f32 s, f32 t) {
     }
 }
 
-void GX_Normal3f32(f32, f32, f32) {}
+void GX_Normal3f32(f32 nx, f32 ny, f32 nz) {
+    gx.current_vertex.normal[0] = nx;
+    gx.current_vertex.normal[1] = ny;
+    gx.current_vertex.normal[2] = nz;
+    gx.current_vertex.has_normal = true;
+}
 
 // EFB operations
 
@@ -945,10 +1445,17 @@ void GX_PeekZ(u16 x, u16 y, u32* z) {
     }
 }
 
-// Stubs for render state (not critical for compute)
+// Render state
 void GX_SetZMode(u8, u8, u8) {}
 void GX_SetZCompLoc(u8) {}
-void GX_SetBlendMode(u8, u8, u8, u8) {}
+
+void GX_SetBlendMode(u8 type, u8 src_fact, u8 dst_fact, u8 op) {
+    gx.blend.mode = type;
+    gx.blend.src_factor = src_fact;
+    gx.blend.dst_factor = dst_fact;
+    gx.blend.logic_op = op;
+}
+
 void GX_SetColorUpdate(u8 enable) { gx.color_update_enabled = (enable != 0); }
 void GX_SetAlphaUpdate(u8 enable) { gx.alpha_update_enabled = (enable != 0); }
 void GX_SetAlphaCompare(u8, u8, u8, u8, u8) {}
