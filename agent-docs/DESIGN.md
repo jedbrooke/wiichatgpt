@@ -22,16 +22,18 @@
 
 ## Architecture Overview
 
+See [MODEL.md](MODEL.md) for the full model specification (architecture, parameter counts, quantization, memory layout, PLE details).
+
 ```
  SD/USB/DVD (slow storage)
   |
-  |  PLE table (~430MB INT4)
-  |  ~25 MB/s SD, ~4KB per token lookup
+  |  PLE table (~245MB INT8)
+  |  ~25 MB/s SD, ~7.5KB per token lookup
   v
 +---------------------------+
 |  MEM2 (64MB GDDR3)       |
-|  Dense transformer core   |
-|  (~70MB INT4)             |
+|  Dense core (~31MB INT8)  |
+|  Embeddings (~12.3MB)     |
 |  Weight textures (tiled)  |
 +---------------------------+
   |          |
@@ -44,7 +46,7 @@
 +------+  +---------------------------+
   |          |
   | activations, reductions,
-  | attention, PLE, small matvecs
+  | attention, PLE, norms
   |          |
   |   large matvecs (tiled)
   |   (output head, QKV, FFN)
@@ -55,34 +57,6 @@
 |  working buffers          |
 +---------------------------+
 ```
-
-## Per-Layer Embeddings (PLE)
-
-Borrowed from Google's Gemma 3n and validated by slvDev's [esp32-ai](https://github.com/slvDev/esp32-ai).
-
-The core idea: most parameters in a transformer can be restructured as a **lookup table** rather than dense compute weights. Each token gets a per-layer embedding vector retrieved by index, not by matrix multiply.
-
-**How it works:**
-1. A large embedding table (the PLE table) maps `token_id -> packed vector` covering all layers
-2. At each transformer layer, the relevant slice is extracted and gated into the residual stream
-3. The lookup is a pure array index, no matmul, effectively free compute
-
-**Memory split:**
-
-| Component | Size (1B model, INT4) | Location |
-|---|---|---|
-| PLE table (~86% of params) | ~430 MB | SD card / USB |
-| Dense core (~14% of params) | ~70 MB | MEM2 (64MB) |
-| Standard embedding + lm_head | ~10-20 MB | MEM2 |
-| Activations, KV cache | ~5-10 MB | MEM1 |
-
-**Per-token I/O from disk:**
-- ~24 layers x ~1-2 KB per layer = ~24-48 KB per token
-- At 25 MB/s SD read: **~1-2 ms per token** for PLE I/O (negligible)
-
-This is what makes a ~1B model feasible on 88MB of total RAM. The dense core that actually needs matrix multiplies is small enough to fit in memory. The bulk of the "knowledge" lives in the PLE table on disk, accessed by cheap random reads.
-
-**Reference:** esp32-ai runs a 28.9M param model (25M in PLE, 559K dense core) at 9.88 tok/s on an ESP32-S3 with only 512KB SRAM + 8MB PSRAM + 16MB flash.
 
 ## GPU Hardware Inventory
 
@@ -149,7 +123,7 @@ Hardware alpha/color blending at the framebuffer write stage.
 
 **For compute:** `GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, ...)` configures additive blending: each new render pass adds its results directly to the existing EFB contents. This enables multi-pass dot product accumulation without CPU readback between passes. Instead of: render pass 1 -> EFB copy -> CPU accumulate -> render pass 2, we get: render pass 1 -> render pass 2 (additive) -> ... -> render pass N -> single EFB copy.
 
-**Precision constraint:** Results are still clamped to 8-bit per channel after each blend. For this to work, per-pass partial sums must be small enough that accumulated totals stay within [0, 255]. For INT4 weights in [0,1] range with 64 MACs per pass, each pass contributes roughly ~8-16/255, so 8 passes total ~64-128/255. This is within range.
+**Precision constraint:** Results are still clamped to 8-bit per channel after each blend. For this to work, per-pass partial sums must be small enough that accumulated totals stay within [0, 255]. With INT8 weights mapped to [0, 255] and 64 MACs per pass, the scale factor must be chosen so per-pass contributions fit within the accumulation range.
 
 ## Compute Strategy
 
@@ -161,7 +135,7 @@ Hardware alpha/color blending at the framebuffer write stage.
 
 3. **Minimize CPU<->GPU round-trips.** Each EFB readback costs ~1-2 ms. The best GPU workloads render many pixels across multiple passes (using additive blend), then read back once.
 
-4. **The output head dominates compute.** Per esp32-ai's profile (the closest reference architecture), the output head consumes ~63% of per-token compute. It is the highest-priority GPU target.
+4. **The output head dominates compute.** The output head (384 x 32K) accounts for ~14 ms of ~54 ms per-token compute (~26%). It is the highest-priority GPU target due to the large number of independent dot products (32K).
 
 ### GPU: Tiled TEV Matmul with Additive Blend
 
@@ -187,13 +161,13 @@ The GPU handles large matrix-vector multiplies: operations where the output dime
 **Per-pass timing:**
 - Full-screen render at 4 pixels/clock: 337K / (243M x 4) = ~0.35 ms
 - With texture fetch + 16 TEV stages: ~1-2 ms per pass
-- K=512 needs 8 passes: ~8-16 ms total render time
+- K=384 needs 6 passes: ~6-12 ms total render time
 - One final EFB copy: ~1-2 ms
-- Total per large matvec: ~10-18 ms
+- Total per large matvec: ~8-14 ms
 
 **Tile size considerations:**
 - EFB: 640 x 528 pixels, each producing one output element
-- With 64 MACs/pixel/pass, a K=512 dot product needs ~8 passes
+- With 64 MACs/pixel/pass, a K=384 dot product needs ~6 passes
 - Output dimension up to ~337K per draw call (far more than any single matvec needs)
 
 **Precision model:**
@@ -201,7 +175,7 @@ The GPU handles large matrix-vector multiplies: operations where the output dime
 - TEV multiply: `a * b / 255` per channel (fixed-point with +128 rounding)
 - Additive blend accumulates 8-bit partial sums, clamped to [0, 255]
 - CPU reads back 8-bit results and scales to fp32
-- For INT4 weights (values -7..7 mapped to ~0..255 via offset), the quantization noise is roughly comparable to running the full model at INT4, which is the storage precision anyway
+- The entire model uses INT8 quantization (see [MODEL.md](MODEL.md)), so the TEV's 8-bit pipeline is a natural match
 
 ### CPU: Paired Singles + GQR Dequant
 
@@ -219,17 +193,18 @@ Weights stay as INT8 in memory (half the bandwidth vs fp32), computation happens
 
 ### Operation Assignment
 
+Shapes use the actual model dimensions: D=384, F=1024, V=32K, H=6 heads, head_dim=64. See [MODEL.md](MODEL.md) for the full architecture.
+
 **GPU (TEV tiled matmul, large matvecs only):**
 
 | Operation | Shape (per layer) | Priority | Rationale |
 |---|---|---|---|
-| Output head | [V, D] * x | Highest | ~63% of compute, V=32K independent dot products |
-| FFN gate | [F, D] * x | High | Large, many output elements |
-| FFN up | [F, D] * x | High | Same shape as gate, can batch |
-| FFN down | [D, F] * g | High | Large inner dimension |
-| QKV projection | [3D, D] * x | High | Large, 3D output elements |
-| Attention output proj | [D, D] * att | High | Large |
-| PLE model projection | [L*P, D] * x | Medium | Large (L*P can be ~3000+) |
+| Output head | [32K, 384] * x | Highest | ~26% of compute, 32K independent dot products |
+| FFN gate | [1024, 384] * x | High | Large, many output elements |
+| FFN up | [1024, 384] * x | High | Same shape as gate, can batch |
+| FFN down | [384, 1024] * g | High | Large inner dimension |
+| QKV projection | [1152, 384] * x | High | 3x384 = 1152 output elements |
+| Attention output proj | [384, 384] * att | High | Large |
 
 **CPU (always, not offloaded):**
 
@@ -237,14 +212,12 @@ Weights stay as INT8 in memory (half the bandwidth vs fp32), computation happens
 |---|---|
 | RMSNorm | Requires reduction (sum of squares) then elementwise. Reductions cannot parallelize across pixels. |
 | Softmax | Requires reduction (max, sum) and exp(). Reduction-heavy. |
-| SiLU / GELU activation | Elementwise nonlinear. Trivial on CPU, not worth GPU round-trip unless part of a larger GPU pipeline (see stretch goals). |
+| SiLU activation | Elementwise nonlinear. Trivial on CPU, not worth GPU round-trip unless part of a larger GPU pipeline (see stretch goals). |
 | SwiGLU elementwise multiply | Small elementwise op between two FFN results. |
 | RoPE | Trig (cos/sin) + elementwise on small vectors. Computed once per position, reused across layers. |
-| Residual adds | Trivial elementwise (size D), not worth GPU overhead. |
-| Attention scores (Q.K) | Many small dot products (head_size ~32-96) + softmax + weighted V sum. Precision-sensitive (softmax requires fp32). Reduction-heavy. |
-| PLE table lookups | SD card I/O, CPU-managed. |
-| PLE combine | Small elementwise (size L*P). |
-| Small matvecs: PLE gate [P, D], PLE proj [D, P] | P=128-256, too small to amortize GPU setup overhead. |
+| Residual adds | Trivial elementwise (384 values), not worth GPU overhead. |
+| Attention scores (Q.K) | Small dot products (head_dim=64) + softmax + weighted V sum. Precision-sensitive (softmax requires fp32). Reduction-heavy. |
+| PLE lookup + combine | SD card I/O (7.5 KB per token) + element-wise multiply and add (384 dims, 20 layers). Negligible compute (~0.3 ms total). |
 | KV cache management | Memory operations. |
 | GX draw call setup, texture uploads | CPU-side GPU control. |
 | Sampling (argmax / top-p) | Sequential, tiny. |
@@ -265,19 +238,19 @@ GPU:            [render QKV matvec...............] -> copytex
 CPU:                                                  RoPE, attn scores, softmax, weighted V
 CPU: [upload attn_proj weights]
 GPU: [render attn_proj matvec...] -> copytex
-CPU:                                 residual add, rmsnorm -> [upload FFN weights]
-GPU:                                                          [render gate+up matvecs...] -> copytex
-CPU:                                                                                        SiLU, SwiGLU mul
+CPU:                                 residual add, PLE combine, rmsnorm -> [upload FFN weights]
+GPU:                                                                       [render gate+up matvecs...] -> copytex
+CPU:                                                                                                      SiLU, SwiGLU mul
 ...
 ```
 
 ### Stretch Goals
 
-1. **Indirect texture activation LUTs:** Bake SiLU/GELU into a 256-entry texture. After the FFN gate matvec renders into the EFB, apply the activation via an indirect texture lookup in a follow-up TEV pass, keeping the data on-GPU between the gate and the SwiGLU multiply. This avoids a CPU round-trip for the activation.
+1. **Indirect texture activation LUTs:** Bake SiLU into a 256-entry texture. After the FFN gate matvec renders into the EFB, apply the activation via an indirect texture lookup in a follow-up TEV pass, keeping the data on-GPU between the gate and the SwiGLU multiply. This avoids a CPU round-trip for the activation.
 
 2. **Full FFN pipeline on GPU:** gate matmul -> SiLU (via indirect LUT) -> elementwise mul with up matmul -> down matmul, all as consecutive GPU render passes without EFB readback until the final result. This is the maximum GPU utilization scenario.
 
-3. **XF texgen-addressed activation LUTs:** Use XF texgen to compute a fp32 dot product per vertex, then use the result (delivered to the TEV as an s17.7 texcoord, 24 usable bits) to address a 1D LUT texture containing SiLU/GELU values. This applies the nonlinearity at 24-bit addressing precision. In the FFN pipeline, the gate matmul partial sums accumulate in the TEV at 8-bit, but the activation function lookup uses the higher-precision texcoord path, improving the error profile where nonlinearities are most sensitive (near zero). Requires routing the gate output through a texgen stage, which limits this to cases where the dot product can be expressed as a single 3x4 or 2x4 matrix-vector multiply per texgen channel.
+3. **XF texgen-addressed activation LUTs:** Use XF texgen to compute a fp32 dot product per vertex, then use the result (delivered to the TEV as an s17.7 texcoord, 24 usable bits) to address a 1D LUT texture containing SiLU values. This applies the nonlinearity at 24-bit addressing precision. In the FFN pipeline, the gate matmul partial sums accumulate in the TEV at 8-bit, but the activation function lookup uses the higher-precision texcoord path, improving the error profile where nonlinearities are most sensitive (near zero). Requires routing the gate output through a texgen stage, which limits this to cases where the dot product can be expressed as a single 3x4 or 2x4 matrix-vector multiply per texgen channel.
 
 ### Throughput: GPU Path to Full Utilization
 
@@ -291,7 +264,7 @@ The gap between theoretical TEV peak (~15.6 GOPS) and realistic throughput:
 
 4. **EFB copy latency.** The final readback via `GX_CopyTex` after all passes. Estimated ~1-2 ms per copy. Only one copy per matvec (not per pass, thanks to additive blend).
 
-5. **Quantization error.** 8-bit TEV math with 8-bit EFB accumulation introduces noise. For INT4 weights already stored at 4-bit precision, the additional TEV quantization error may be acceptable. Needs empirical validation.
+5. **Quantization error.** 8-bit TEV math with 8-bit EFB accumulation introduces noise. With INT8 weights, the TEV pipeline matches the storage precision, so additional quantization error should be minimal. Needs empirical validation.
 
 **Validation milestones:**
 1. Tiled matmul with additive blend in the GX simulator (correctness + precision)
@@ -315,8 +288,7 @@ The gap between theoretical TEV peak (~15.6 GOPS) and realistic throughput:
 2. Integrate PLE from esp32-ai for the embedding architecture
 3. Replace the naive matmul with paired-singles CPU kernel (`psq_l` + `ps_madd`)
 4. Add TEV-accelerated tiled matmul backend for large matvecs
-5. Scale up model size, validate with increasingly large models
-6. If needed, migrate toward ggml backend for better quantization formats (GGUF, Q4_K, etc.)
+5. Scale up to the 288M model, validate end-to-end inference
 
 **Other references:**
 - [Tilka/llvm-ppc750cl](https://github.com/Tilka/llvm-ppc750cl): LLVM fork with paired singles support, could help get compiler-emitted `ps_madd`/`psq_l`
@@ -326,56 +298,29 @@ The gap between theoretical TEV peak (~15.6 GOPS) and realistic throughput:
 
 ## Model
 
-Custom trained/fine-tuned, ~500M-1B params, PLE architecture.
+288M total params (31M dense core, 12.3M embeddings, 245M PLE table). INT8 quantization throughout. See [MODEL.md](MODEL.md) for the full specification.
 
-**Quantization:** INT4 for weights (dense core + PLE table), fp32 accumulation. The Wii has no FP16 hardware. INT8 via GQR dequant is the native fast path on the CPU. INT4 packs tighter for storage but requires unpacking to INT8/fp32 at load time.
+The PLE architecture lets us have a 288M parameter model while keeping only ~43 MB of weights in RAM. The 245M PLE parameters live on disk (SD card primary, DVD future target) and are accessed via cheap O(1) lookups at 7.5 KB per token.
 
-**Training:** handled externally (Jake). Architecture should follow the Gemma 3n PLE pattern:
-- Dense core: attention (Q/K/V/O projections), FFN (gate/up/down), layer norms
-- PLE table: per-layer embedding vectors, indexed by token ID
-- Standard embedding + tied lm_head for output projection
+### esp32-ai Per-Token Profile (reference)
 
-**Domain:** Wii trivia, popular Wii games, Nintendo lore. Not general-purpose.
+From esp32-ai's profile (28.9M model, 559K dense core, ESP32-S3):
 
-### Per-token operation breakdown
+| Stage | Share | Operations |
+|---|---|---|
+| Output head | 63% | Single large matvec [V, D] * x |
+| Attention | 22% | QKV matvec + RoPE + Q.K scores + softmax + weighted V + attn_proj matvec |
+| PLE path | 7% | PLE model proj matvec + PLE gate matvec + GELU + PLE proj matvec + RMSNorm |
+| FFN | 7% | Gate matvec + up matvec + SiLU + SwiGLU mul + down matvec + RMSNorm |
+| Input | 2% | Embedding lookup + PLE table lookup + PLE combine |
 
-From esp32-ai's profile (28.9M model, 559K dense core, ESP32-S3), the per-token compute breaks down as:
+Note: esp32-ai uses PLE projection matrices (PLE dim != hidden_dim). Our model has PLE dim = hidden_dim, so PLE requires no projection matvecs, just element-wise multiply + add. The 7% PLE path cost from esp32-ai drops to near zero in our architecture, shifting compute share to the other stages. Our per-token breakdown from MODEL.md: ~36 ms dense core matmuls, ~14 ms output head, ~4 ms overhead, ~0.3 ms PLE = ~54 ms total (~18 tok/s).
 
-| Stage | ms/token | Share | Operations |
-|---|---|---|---|
-| Output head | 59.4 | 63% | Single large matvec [V, D] * x |
-| Attention | 20.5 | 22% | QKV matvec + RoPE + Q.K scores + softmax + weighted V + attn_proj matvec |
-| PLE path | 6.4 | 7% | PLE model proj matvec + PLE gate matvec + GELU + PLE proj matvec + RMSNorm |
-| FFN | 6.5 | 7% | Gate matvec + up matvec + SiLU + SwiGLU mul + down matvec + RMSNorm |
-| Input | 2.2 | 2% | Embedding lookup + PLE table lookup + PLE combine |
+## Performance Estimates
 
-The output head alone is 63% of compute. At the Wii's larger model sizes the ratios shift (the head shrinks proportionally as the per-layer ops grow with more layers), but it remains a substantial fraction.
+See [MODEL.md](MODEL.md) for the detailed per-token breakdown and KV cache scaling table.
 
-## Memory Map (target)
-
-```
-MEM1 (24 MB, 1T-SRAM, ~1.9 GB/s):
-  Activations buffer       ~4 MB
-  KV cache                 ~8 MB  (depends on context length)
-  Working scratch          ~4 MB
-  Code + stack             ~2 MB
-  GX FIFO + command buffer ~1 MB
-  Remaining                ~5 MB
-
-MEM2 (64 MB, GDDR3, ~3.9 GB/s):
-  Dense core weights       ~50-70 MB (INT4)
-  Standard embeddings      ~10 MB
-  Weight texture tiles     ~2-4 MB (double-buffered)
-  Remaining                ~0-2 MB
-
-SD/USB (external, ~25 MB/s):
-  PLE table                ~430 MB (INT4)
-  Tokenizer vocabulary     ~1 MB
-```
-
-## Performance Estimates (Napkin Math)
-
-All numbers assume the PLE architecture (dense core in RAM, PLE table on SD card). PLE I/O overhead (~24-48 KB per token from SD at 25 MB/s = ~1-2 ms) is negligible at all model sizes and ignored below.
+**Summary:** 288M total model, 31M dense core in RAM (INT8), ~54 ms/token, ~18 tok/s CPU-only. With GPU acceleration on large matvecs: ~25+ tok/s estimated.
 
 **Ground rules:**
 - FLOPs per token for a transformer at batch=1: roughly `2 * P_dense` (one multiply + one add per weight)
@@ -383,73 +328,32 @@ All numbers assume the PLE architecture (dense core in RAM, PLE table on SD card
 - CPU memory ceiling: ~1.9 GB/s (MEM2 via CPU bus)
 - GPU memory ceiling: ~3.9 GB/s (MEM2 via GPU bus)
 
-### Model size sweep (with ~86% PLE / 14% dense split)
+### CPU-only estimate
 
-| Total model | Dense core | Dense size (INT4) | Dense size (INT8) | Fits MEM2 (64MB)? |
-|---|---|---|---|---|
-| 100M | 14M | 7 MB | 14 MB | Yes, easily |
-| 300M | 42M | 21 MB | 42 MB | Yes |
-| 500M | 70M | 35 MB | 70 MB | INT4 yes, INT8 barely |
-| 1B | 140M | 70 MB | 140 MB | INT4 tight (70/64MB), INT8 no |
+31M dense core at INT8 = ~62M FLOPs/token. At ~1.7 GFLOPS sustained: ~36 ms for dense core matmuls. Add ~14 ms for the output head (384 x 32K) and ~4 ms overhead (norms, softmax, activations, residuals, RoPE). Total: ~54 ms/token, ~18 tok/s.
 
-### tok/s estimates: CPU-only (paired singles, ~1.7 GFLOPS sustained at ~60% utilization)
+### GPU TEV estimate
 
-| Dense core | FLOPs/token | Time/token | tok/s |
-|---|---|---|---|
-| 14M (100M total) | 28M | 16 ms | ~62 |
-| 42M (300M total) | 84M | 49 ms | ~20 |
-| 70M (500M total) | 140M | 82 ms | ~12 |
-| 140M (1B total) | 280M | 165 ms | ~6 |
+For the output head alone (384 x 32K): K=384 requires ~6 TEV passes. At ~1-2 ms/pass plus ~1-2 ms EFB copy: ~8-14 ms total. The CPU path takes ~14 ms for the same operation, so the GPU breaks even or wins here.
 
-### tok/s estimates: GPU TEV (memory-bandwidth-bound at 3.9 GB/s, INT8 weights)
+For per-layer matvecs (QKV [1152, 384], FFN gate/up [1024, 384], FFN down [384, 1024], attn proj [384, 384]): each needs ~6 passes at K=384 or ~16 passes at K=1024. GPU wins on the larger ones (FFN down), CPU may win on smaller ones (attn proj). The crossover point needs measurement (see Open Questions).
 
-| Dense core | BW ceiling tok/s | At 30% util | At 50% util |
-|---|---|---|---|
-| 14M | 278 | 83 | 139 |
-| 42M | 93 | 28 | 46 |
-| 70M | 56 | 17 | 28 |
-| 140M | 28 | 8.4 | 14 |
+### Bandwidth sanity check
 
-### tok/s estimates: CPU + GPU combined (overlapped)
+31M INT8 weights = 31 MB read per token. At 1.9 GB/s CPU bus: ~16 ms bandwidth ceiling = ~62 tok/s. At 3.9 GB/s GPU bus: ~8 ms bandwidth ceiling = ~125 tok/s. We are compute-bound, not bandwidth-bound: the ~54 ms compute time is well above the ~16 ms bandwidth floor.
 
-GPU handles the large matvecs (output head, QKV, FFN projections), CPU handles attention scores, activations, reductions, PLE, and small matvecs in parallel.
+### Reference comparisons
 
-| Dense core | Total model | Conservative | Optimistic |
-|---|---|---|---|
-| 14M | 100M | ~60 tok/s | ~100+ tok/s |
-| 42M | 300M | ~20 tok/s | ~35 tok/s |
-| 70M | 500M | ~15 tok/s | ~25 tok/s |
-| 140M | 1B | ~8 tok/s | ~12 tok/s |
+**Dreamcast:** 15M dense model at ~1 tok/s on 200MHz SH-4 (naive code, no SIMD). Our 31M dense model at ~18 tok/s on 729MHz PPC with paired singles. Accounting for 2x model size, the per-parameter throughput gap is ~36x: 3.6x clock, ~2x SIMD, plus optimized kernels. Aggressive but plausible.
 
-### Targets
-
-| Target | Required tok/s | Max dense core (conservative) | Max total model (with PLE) |
-|---|---|---|---|
-| Real-time (10 tok/s) | 10 | ~120M | ~850M |
-| Minimum viable (1 tok/s) | 1 | ~1B+ | ~7B+ |
-
-**The sweet spot is 500M-1B total model with PLE**, giving a 70-140M dense core. At the low end (500M, 70M dense), we comfortably clear 10 tok/s. At the high end (~850M-1B, ~120-140M dense), we're right on the edge of real-time and GPU utilization is the difference between hitting 10 tok/s and falling short. INT4 quantization for the dense core is required at the 1B end to fit MEM2.
-
-### Sanity checks
-
-**Memory bandwidth check (1B model):** 140M INT8 weights = 140MB read per token. At 1.9 GB/s CPU bus: 74ms/token = 13.5 tok/s ceiling. At 3.9 GB/s GPU bus: 36ms/token = 28 tok/s ceiling. We're compute-bound on CPU, bandwidth-bound on GPU.
-
-**Dreamcast reference:** 15M dense model at ~1 tok/s on 200MHz SH-4 (naive code, no SIMD). Our 14M dense estimate is ~62 tok/s on a 729MHz PPC with paired singles. The ~60x gap: 3.6x clock, ~2x SIMD, plus optimized kernels. Aggressive but plausible.
-
-**esp32-ai reference:** 559K dense core at 9.88 tok/s on ESP32-S3 (240MHz, no FP SIMD). Direction checks out for our scaling.
+**esp32-ai:** 559K dense core at 9.88 tok/s on ESP32-S3 (240MHz, no FP SIMD). Our 31M dense core is ~56x larger. At ~18 tok/s we are ~1.8x faster despite the larger model, thanks to 3x clock and paired-singles SIMD.
 
 ## Open Questions
 
-1. **EFB additive blend precision:** Can multi-pass 8-bit additive accumulation produce usable results for a 512-element dot product? Per-pass partial sums must stay within [0, 255] range across all passes. Needs validation in the GX simulator and empirically on hardware.
+1. **EFB additive blend precision:** Can multi-pass 8-bit additive accumulation produce usable results for a 384-element dot product? Per-pass partial sums must stay within [0, 255] range across all 6 passes. Needs validation in the GX simulator and empirically on hardware.
 
 2. **EFB copy latency:** Real hardware timing for `GX_CopyTex` is not well documented. Only one copy per matvec (thanks to additive blend), but this is still the GPU path's fixed overhead. This is the make-or-break number for GPU utilization.
 
-3. **GPU vs CPU crossover point:** At what matrix size does the GPU TEV path actually beat CPU paired-singles? Small matvecs (PLE gate at [128, D]) almost certainly lose to CPU due to setup overhead. Large ones (output head at [32K, D]) should win. The crossover needs measurement.
+3. **GPU vs CPU crossover point:** At what matrix size does the GPU TEV path actually beat CPU paired-singles? Small matvecs (attn proj at [384, 384]) may lose to CPU due to setup overhead. Large ones (output head at [32K, 384]) should win. The crossover needs measurement.
 
-4. **Model architecture details:** Exact layer count, hidden dim, head count, PLE dim, for a ~1B model that fits the memory budget. Jake needs these constraints for training.
-
-5. **DVD random read performance:** PLE lookups are random-access by token ID. DVD seek latency (~100ms) may make DVD impractical for PLE; SD card (low-ms seek) is likely required. DVD may still work for sequential weight loading at boot.
-
-6. **Context length:** KV cache size scales linearly with context. At 24 layers x 512 hidden x 2 (K+V) x fp32, each token position costs ~96KB. A 256-token context = ~24MB of KV cache, consuming most of MEM1. May need INT8 KV cache or shorter context.
-
-7. **XF compute potential (resolved):** The XF is not viable as a general fp32 matmul accelerator: throughput is 6-17x slower than CPU paired-singles, there is no CPU readback of texcoord values (only EFB color/depth), and packing work into many vertices starves the TEV. However, texgen outputs enter the TEV as s17.7 fixed-point texcoords (24 usable bits), which makes the XF useful for high-precision LUT addressing in activation functions. See Stretch Goal 3.
+4. **XF compute potential (resolved):** The XF is not viable as a general fp32 matmul accelerator: throughput is 6-17x slower than CPU paired-singles, there is no CPU readback of texcoord values (only EFB color/depth), and packing work into many vertices starves the TEV. However, texgen outputs enter the TEV as s17.7 fixed-point texcoords (24 usable bits), which makes the XF useful for high-precision LUT addressing in activation functions. See Stretch Goal 3.
