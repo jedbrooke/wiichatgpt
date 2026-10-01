@@ -205,6 +205,38 @@ TEST(test_softmax) {
     ASSERT_NEAR(y[2], 0.6652f, 0.001f);
 }
 
+// INT8 matvec with fused dequant
+TEST(test_matvec_q8) {
+    // W = [[1, 2, 3], [4, 5, 6]] as int8, scale = 0.1
+    // So dequanted W = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+    // x = [7, 8, 9]
+    // y[0] = 0.1*7 + 0.2*8 + 0.3*9 = 0.7 + 1.6 + 2.7 = 5.0
+    // y[1] = 0.4*7 + 0.5*8 + 0.6*9 = 2.8 + 4.0 + 5.4 = 12.2
+    signed char W[] = {1, 2, 3, 4, 5, 6};
+    float scale = 0.1f;
+    float x[] = {7.0f, 8.0f, 9.0f};
+    float y[2];
+    wii_matvec_q8(W, scale, x, y, 2, 3);
+
+    ASSERT_NEAR(y[0], 5.0f, 0.001f);
+    ASSERT_NEAR(y[1], 12.2f, 0.001f);
+}
+
+// INT8 matvec: verify scale factor
+TEST(test_matvec_q8_scale) {
+    // W = [127, -128] as int8, scale = 0.01
+    // dequanted = [1.27, -1.28]
+    // x = [1.0, 1.0]
+    // y[0] = 1.27 + (-1.28) = -0.01
+    signed char W[] = {127, -128};
+    float scale = 0.01f;
+    float x[] = {1.0f, 1.0f};
+    float y[1];
+    wii_matvec_q8(W, scale, x, y, 1, 2);
+
+    ASSERT_NEAR(y[0], -0.01f, 0.001f);
+}
+
 // RMS normalization
 TEST(test_rmsnorm) {
     float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -238,6 +270,8 @@ int main() {
     RUN(test_relu);
     RUN(test_silu);
     RUN(test_softmax);
+    RUN(test_matvec_q8);
+    RUN(test_matvec_q8_scale);
     RUN(test_rmsnorm);
 
     wii_math_shutdown();

@@ -29,6 +29,10 @@ endif()
 add_executable(test_matmul tests/test_matmul.cpp)
 target_link_libraries(test_matmul PRIVATE wii_math)
 
+# LLM inference executable
+add_executable(llm_inference src/llm.cpp)
+target_link_libraries(llm_inference PRIVATE wii_math)
+
 # CTest integration
 enable_testing()
 add_test(NAME tev COMMAND test_tev)

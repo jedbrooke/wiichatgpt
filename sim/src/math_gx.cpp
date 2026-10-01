@@ -19,6 +19,7 @@
 #include "gx.h"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -288,4 +289,11 @@ void wii_rmsnorm(const float* x, const float* weight, float* y, int n) {
     for (int i = 0; i < n; i++) {
         y[i] = x[i] * ss * weight[i];
     }
+}
+
+void wii_matvec_q8(const signed char* W, float scale, const float* x,
+                   float* y, int M, int K) {
+    (void)W; (void)scale; (void)x; (void)y; (void)M; (void)K;
+    fprintf(stderr, "wii_matvec_q8: not implemented for GX backend\n");
+    exit(1);
 }

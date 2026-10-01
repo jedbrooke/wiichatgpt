@@ -44,6 +44,14 @@ void wii_softmax(const float* x, float* y, int n);
 // RMS normalization: y[i] = x[i] / rms(x) * weight[i]
 void wii_rmsnorm(const float* x, const float* weight, float* y, int n);
 
+// INT8 matrix-vector multiply with fused dequant: y = dequant(W) * x
+// W is M x K int8 (row-major), scale is per-tensor fp32 scale factor.
+// x is length K fp32, y is length M fp32.
+// CPU backend: dequants row-by-row (no scratch buffer needed).
+// On real Wii hardware: psq_l (int8 load+dequant) + ps_madd.
+void wii_matvec_q8(const signed char* W, float scale, const float* x,
+                   float* y, int M, int K);
+
 #ifdef __cplusplus
 }
 #endif

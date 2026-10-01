@@ -84,3 +84,14 @@ void wii_rmsnorm(const float* x, const float* weight, float* y, int n) {
         y[i] = x[i] * ss * weight[i];
     }
 }
+
+void wii_matvec_q8(const signed char* W, float scale, const float* x,
+                   float* y, int M, int K) {
+    for (int i = 0; i < M; i++) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += (float)W[i * K + k] * x[k];
+        }
+        y[i] = sum * scale;
+    }
+}
