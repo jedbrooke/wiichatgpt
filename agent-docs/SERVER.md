@@ -113,12 +113,24 @@ loop:
 
 ### Request parser
 
-Minimal HTTP/1.1 parser. Reads line-by-line from the socket until the header terminator (`\r\n\r\n`). Extracts only:
+Uses [picohttpparser](https://github.com/h2o/picohttpparser) (two files: `picohttpparser.c` + `picohttpparser.h`, MIT license). Zero-allocation, zero-copy HTTP/1.x parser used in production by the h2o HTTP server. Returns pointers directly into the receive buffer for method, path, and headers.
 
-- Request method and path from the request line
-- `Content-Length` header value
+```c
+char buf[4096];
+const char *method, *path;
+size_t method_len, path_len, num_headers = 32;
+int minor_version;
+struct phr_header headers[32];
 
-No support for chunked request encoding, `Transfer-Encoding`, `Expect: 100-continue`, or HTTP pipelining. Requests exceeding the max body size (64 KB default) get a 413 response.
+size_t bytes = sock_recv(client_fd, buf, sizeof(buf), 0);
+int parsed = phr_parse_request(buf, bytes,
+    &method, &method_len, &path, &path_len,
+    &minor_version, headers, &num_headers, 0);
+```
+
+After parsing headers, the `Content-Length` value is found by iterating the `headers` array and the body is read from the socket in a second `recv` call (up to `max_body_size` bytes, default 64 KB). Requests exceeding the limit get a 413 response.
+
+No support for chunked request encoding, `Expect: 100-continue`, or HTTP pipelining.
 
 ### Connection handling
 
@@ -263,11 +275,12 @@ The server runs alongside the full inference stack. From [MODEL.md](MODEL.md), M
 
 | Component | Size |
 |---|---|
+| picohttpparser code | ~3 KB |
 | cJSON library code | ~50 KB |
 | HTTP request buffer (max body) | ~64 KB |
 | SSE write buffer | ~4 KB |
 | cJSON working memory (per-token alloc/free) | ~2 KB peak |
-| **Total server overhead** | **~120 KB** |
+| **Total server overhead** | **~123 KB** |
 
 ### MEM1 additions
 
@@ -366,11 +379,16 @@ for chunk in client.chat.completions.create(
 
 ```
 server/
-  server_main.cpp    # config loading, model init, accept loop
-  http_server.cpp    # socket setup, request parsing, routing
-  http_server.h      # public interface
-  sse_writer.cpp     # token callback, SSE formatting, socket writes
+  server_main.cpp      # config loading, model init, accept loop
+  http_server.cpp      # socket setup, routing, response helpers
+  http_server.h        # public interface
+  sse_writer.cpp       # token callback, SSE formatting, socket writes
   sse_writer.h
+vendor/
+  picohttpparser.c     # HTTP request parser (h2o/picohttpparser, MIT)
+  picohttpparser.h
+  cJSON.c              # JSON parser/builder (DaveGamble/cJSON, MIT)
+  cJSON.h
 ```
 
-LLM code linked in from the inference build. UI code is not linked (server is headless). cJSON compiled as part of the server target.
+LLM code linked in from the inference build. UI code is not linked (server is headless).
