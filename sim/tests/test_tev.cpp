@@ -1,6 +1,9 @@
 // Tests for the GX TEV simulator.
 // Validates the TEV combiner formula, EFB read/write, texture sampling,
 // and various TEV stage configurations.
+//
+// Tests that draw quads use GX_DrawDone() to flush the FIFO before reading
+// results via GX_CopyTex (the pipeline path) or GX_PeekARGB (direct access).
 
 #include "gx.h"
 #include <cassert>
@@ -45,9 +48,31 @@ static void init_gx() {
     GX_SetNumTevStages(1);
     GX_SetColorUpdate(GX_TRUE);
     GX_SetAlphaUpdate(GX_TRUE);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
 }
 
-// EFB poke/peek round-trip
+// Helper: read a single pixel from EFB via CopyTex (pipeline path).
+static void read_pixel(u16 x, u16 y, u8 out[4]) {
+    GX_SetTexCopySrc(x, y, 1, 1);
+    GX_SetTexCopyDst(1, 1, GX_TF_RGBA8, GX_FALSE);
+    GX_CopyTex(out, GX_FALSE);
+}
+
+// Helper: draw a 1x1 quad at a position with uniform vertex color.
+static void draw_quad(f32 x0, f32 y0, f32 x1, f32 y1, u8 r, u8 g, u8 b, u8 a) {
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+        GX_Position2f32(x0, y0); GX_Color4u8(r, g, b, a);
+        GX_Position2f32(x1, y0); GX_Color4u8(r, g, b, a);
+        GX_Position2f32(x1, y1); GX_Color4u8(r, g, b, a);
+        GX_Position2f32(x0, y1); GX_Color4u8(r, g, b, a);
+    GX_End();
+}
+
+// EFB poke/peek round-trip (direct access, no pipeline)
 TEST(test_efb_poke_peek) {
     init_gx();
     GXColor in = {100, 150, 200, 250};
@@ -67,23 +92,15 @@ TEST(test_tev_passclr) {
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(5.0f, 5.0f, 6.0f, 6.0f, 42, 84, 126, 168);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(5.0f, 5.0f);  GX_Color4u8(42, 84, 126, 168);
-        GX_Position2f32(6.0f, 5.0f);  GX_Color4u8(42, 84, 126, 168);
-        GX_Position2f32(6.0f, 6.0f);  GX_Color4u8(42, 84, 126, 168);
-        GX_Position2f32(5.0f, 6.0f);  GX_Color4u8(42, 84, 126, 168);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(5, 5, &out);
-    ASSERT_EQ(out.r, 42);
-    ASSERT_EQ(out.g, 84);
-    ASSERT_EQ(out.b, 126);
-    ASSERT_EQ(out.a, 168);
+    u8 out[4];
+    read_pixel(5, 5, out);
+    ASSERT_EQ(out[0], 42);
+    ASSERT_EQ(out[1], 84);
+    ASSERT_EQ(out[2], 126);
+    ASSERT_EQ(out[3], 168);
 }
 
 // TEV REPLACE with konst color: output = konst
@@ -101,23 +118,15 @@ TEST(test_tev_konst_replace) {
     GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 255, 255, 255, 255);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(255, 255, 255, 255);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(255, 255, 255, 255);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(255, 255, 255, 255);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(255, 255, 255, 255);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
-    ASSERT_EQ(out.r, 77);
-    ASSERT_EQ(out.g, 88);
-    ASSERT_EQ(out.b, 99);
-    ASSERT_EQ(out.a, 110);
+    u8 out[4];
+    read_pixel(0, 0, out);
+    ASSERT_EQ(out[0], 77);
+    ASSERT_EQ(out[1], 88);
+    ASSERT_EQ(out[2], 99);
+    ASSERT_EQ(out[3], 110);
 }
 
 // TEV multiply: out = ras * konst (via lerp trick)
@@ -136,25 +145,17 @@ TEST(test_tev_multiply) {
     GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 200, 200, 200, 200);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
+    u8 out[4];
+    read_pixel(0, 0, out);
 
     // Expected: lerp = ((255-200)*0 + 200*128 + 128) >> 8 = (25600 + 128) >> 8 = 100
-    ASSERT_EQ(out.r, 100);
-    ASSERT_EQ(out.g, 100);
-    ASSERT_EQ(out.b, 100);
-    ASSERT_EQ(out.a, 100);
+    ASSERT_EQ(out[0], 100);
+    ASSERT_EQ(out[1], 100);
+    ASSERT_EQ(out[2], 100);
+    ASSERT_EQ(out[3], 100);
 }
 
 // TEV addition: out = ras + konst (clamped to 255)
@@ -173,26 +174,18 @@ TEST(test_tev_add) {
     GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 100, 100, 100, 100);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(100, 100, 100, 100);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(100, 100, 100, 100);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(100, 100, 100, 100);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(100, 100, 100, 100);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
+    u8 out[4];
+    read_pixel(0, 0, out);
 
     // lerp = ((255-0)*50 + 0*0 + 128) >> 8 = (12750 + 128) >> 8 = 50
     // result = d + lerp = 100 + 50 = 150
-    ASSERT_EQ(out.r, 150);
-    ASSERT_EQ(out.g, 150);
-    ASSERT_EQ(out.b, 150);
-    ASSERT_EQ(out.a, 150);
+    ASSERT_EQ(out[0], 150);
+    ASSERT_EQ(out[1], 150);
+    ASSERT_EQ(out[2], 150);
+    ASSERT_EQ(out[3], 150);
 }
 
 // TEV subtraction: out = d - lerp(a,b,c)
@@ -211,26 +204,18 @@ TEST(test_tev_subtract) {
     GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_SUB, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 200, 200, 200, 200);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
+    u8 out[4];
+    read_pixel(0, 0, out);
 
     // lerp = ((255-0)*50 + 128) >> 8 = 50
     // result = 200 - 50 = 150
-    ASSERT_EQ(out.r, 150);
-    ASSERT_EQ(out.g, 150);
-    ASSERT_EQ(out.b, 150);
-    ASSERT_EQ(out.a, 150);
+    ASSERT_EQ(out[0], 150);
+    ASSERT_EQ(out[1], 150);
+    ASSERT_EQ(out[2], 150);
+    ASSERT_EQ(out[3], 150);
 }
 
 // TEV scale x2
@@ -244,21 +229,13 @@ TEST(test_tev_scale_x2) {
     GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_2, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 60, 60, 60, 60);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(60, 60, 60, 60);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(60, 60, 60, 60);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(60, 60, 60, 60);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(60, 60, 60, 60);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
-    ASSERT_EQ(out.r, 120);
-    ASSERT_EQ(out.g, 120);
+    u8 out[4];
+    read_pixel(0, 0, out);
+    ASSERT_EQ(out[0], 120);
+    ASSERT_EQ(out[1], 120);
 }
 
 // Multi-stage TEV: stage0 writes TEVREG0, stage1 reads it and adds to RASC
@@ -284,23 +261,15 @@ TEST(test_tev_two_stages) {
     GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 70, 70, 70, 70);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(70, 70, 70, 70);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(70, 70, 70, 70);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(70, 70, 70, 70);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(70, 70, 70, 70);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
+    u8 out[4];
+    read_pixel(0, 0, out);
     // stage0: TEVREG0 = 30
     // stage1: lerp(30, 0, 0) = ((255)*30 + 128)>>8 = 30, result = 70 + 30 = 100
-    ASSERT_EQ(out.r, 100);
-    ASSERT_EQ(out.g, 100);
+    ASSERT_EQ(out[0], 100);
+    ASSERT_EQ(out[1], 100);
 }
 
 // Texture sampling through TEV
@@ -335,14 +304,15 @@ TEST(test_tev_texture_replace) {
         GX_Position2f32(2.0f, 2.0f); GX_Color4u8(255,255,255,255); GX_TexCoord2f32(1.0f, 1.0f);
         GX_Position2f32(0.0f, 2.0f); GX_Color4u8(255,255,255,255); GX_TexCoord2f32(0.0f, 1.0f);
     GX_End();
+    GX_DrawDone();
 
     // Check pixel (0,0): should be red (texcoord ~(0,0) -> texel (0,0))
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
-    ASSERT_EQ(out.r, 255);
-    ASSERT_EQ(out.g, 0);
-    ASSERT_EQ(out.b, 0);
-    ASSERT_EQ(out.a, 255);
+    u8 out[4];
+    read_pixel(0, 0, out);
+    ASSERT_EQ(out[0], 255);
+    ASSERT_EQ(out[1], 0);
+    ASSERT_EQ(out[2], 0);
+    ASSERT_EQ(out[3], 255);
 }
 
 // EFB additive blend: two passes at the same pixel, verify accumulation
@@ -359,34 +329,22 @@ TEST(test_efb_additive_blend) {
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(40, 40, 40, 40);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(40, 40, 40, 40);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(40, 40, 40, 40);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(40, 40, 40, 40);
-    GX_End();
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 40, 40, 40, 40);
+    GX_DrawDone();
 
     // Second pass: write 60 to all channels (should add to the 40)
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(60, 60, 60, 60);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(60, 60, 60, 60);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(60, 60, 60, 60);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(60, 60, 60, 60);
-    GX_End();
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 60, 60, 60, 60);
+    GX_DrawDone();
 
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
+    u8 out[4];
+    read_pixel(0, 0, out);
 
     // With GX_BL_ONE (factor=255): (val*255+128)/256 preserves the value exactly
     // for any u8 input. Pass 1: 40+0=40. Pass 2: 60+40=100.
-    ASSERT_EQ(out.r, 100);
-    ASSERT_EQ(out.g, 100);
-    ASSERT_EQ(out.b, 100);
-    ASSERT_EQ(out.a, 100);
+    ASSERT_EQ(out[0], 100);
+    ASSERT_EQ(out[1], 100);
+    ASSERT_EQ(out[2], 100);
+    ASSERT_EQ(out[3], 100);
 
     // Reset blend mode
     GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
@@ -405,24 +363,16 @@ TEST(test_efb_blend_saturation) {
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 200, 200, 200, 200);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(200, 200, 200, 200);
-    GX_End();
+    u8 out[4];
+    read_pixel(0, 0, out);
 
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
-
-    ASSERT_EQ(out.r, 255);
-    ASSERT_EQ(out.g, 255);
-    ASSERT_EQ(out.b, 255);
-    ASSERT_EQ(out.a, 255);
+    ASSERT_EQ(out[0], 255);
+    ASSERT_EQ(out[1], 255);
+    ASSERT_EQ(out[2], 255);
+    ASSERT_EQ(out[3], 255);
 
     GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
 }
@@ -443,11 +393,7 @@ TEST(test_multi_pass_dot_product) {
     // with                     [0.3, 0.2, 0.1, 0.4, 0.2, 0.3, 0.5, 0.6]
     // Split into two passes of 4 MACs each (via RGBA channels).
 
-    // Pass 1: a=[0.2, 0.3, 0.4, 0.1], b=[0.3, 0.2, 0.1, 0.4]
-    u8 a1_r = 51, a1_g = 77, a1_b = 102, a1_a = 26;   // 0.2, 0.3, 0.4, 0.1 in [0,255]
-    u8 b1_r = 77, b1_g = 51, b1_b = 26,  b1_a = 102;  // 0.3, 0.2, 0.1, 0.4
-
-    GX_SetTevKColor(0, (GXColor){b1_r, b1_g, b1_b, b1_a});
+    // Configure TEV for multiply
     GX_SetTevKColorSel(GX_TEVSTAGE0, GX_TEV_KCSEL_K0);
     GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
     GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_KONST, GX_CC_RASC, GX_CC_ZERO);
@@ -456,35 +402,25 @@ TEST(test_multi_pass_dot_product) {
     GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    // Pass 1: a=[0.2, 0.3, 0.4, 0.1], b=[0.3, 0.2, 0.1, 0.4]
+    u8 a1_r = 51, a1_g = 77, a1_b = 102, a1_a = 26;   // 0.2, 0.3, 0.4, 0.1 in [0,255]
+    u8 b1_r = 77, b1_g = 51, b1_b = 26,  b1_a = 102;  // 0.3, 0.2, 0.1, 0.4
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(a1_r, a1_g, a1_b, a1_a);
-    GX_End();
+    GX_SetTevKColor(0, (GXColor){b1_r, b1_g, b1_b, b1_a});
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, a1_r, a1_g, a1_b, a1_a);
+    GX_DrawDone();
 
     // Pass 2: a=[0.5, 0.6, 0.2, 0.1], b=[0.2, 0.3, 0.5, 0.6]
     u8 a2_r = 128, a2_g = 153, a2_b = 51, a2_a = 26;
     u8 b2_r = 51,  b2_g = 77,  b2_b = 128, b2_a = 153;
 
     GX_SetTevKColor(0, (GXColor){b2_r, b2_g, b2_b, b2_a});
-
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(a2_r, a2_g, a2_b, a2_a);
-    GX_End();
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, a2_r, a2_g, a2_b, a2_a);
+    GX_DrawDone();
 
     // Read back via CopyTex (the production path)
-    GX_SetTexCopySrc(0, 0, 1, 1);
-    GX_SetTexCopyDst(1, 1, GX_TF_RGBA8, GX_FALSE);
     u8 result[4] = {0};
-    GX_CopyTex(result, GX_FALSE);
+    read_pixel(0, 0, result);
 
     // Each channel holds one accumulated product pair.
     // The exact values depend on 8-bit quantization and blend rounding,
@@ -495,16 +431,7 @@ TEST(test_multi_pass_dot_product) {
     //           = 0.06 + 0.06 + 0.04 + 0.04 + 0.10 + 0.18 + 0.10 + 0.06 = 0.64
     //
     // In the u8 domain each product and accumulation loses precision.
-    // The sum of the 4 readback channels (each representing a partial dot product
-    // in [0,255] space) should be roughly 0.64 * 255 = ~163 when summed and
-    // rescaled, but we're reading raw u8 values that each went through
-    // multiply + two additive blend passes. Just check each channel is nonzero
-    // and the total is reasonable.
     int total = result[0] + result[1] + result[2] + result[3];
-    // Each channel sees ~(product1 + product2) in [0..255].
-    // Product1 channels: ~15, ~15, ~10, ~10; Product2 channels: ~25, ~46, ~25, ~15
-    // Accumulated per channel: ~40, ~61, ~35, ~25 -> total ~161
-    // Allow generous tolerance for 8-bit rounding across two blend passes.
     if (total < 100 || total > 220) {
         printf("FAIL\n    multi_pass_dot_product total=%d, expected ~161\n", total);
         tests_failed++;
@@ -527,23 +454,15 @@ TEST(test_efb_subtract_blend) {
     GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 
-    GX_ClearVtxDesc();
-    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 50, 50, 50, 50);
+    GX_DrawDone();
 
-    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-        GX_Position2f32(0.0f, 0.0f); GX_Color4u8(50, 50, 50, 50);
-        GX_Position2f32(1.0f, 0.0f); GX_Color4u8(50, 50, 50, 50);
-        GX_Position2f32(1.0f, 1.0f); GX_Color4u8(50, 50, 50, 50);
-        GX_Position2f32(0.0f, 1.0f); GX_Color4u8(50, 50, 50, 50);
-    GX_End();
-
-    GXColor out;
-    GX_PeekARGB(0, 0, &out);
-    ASSERT_EQ(out.r, 150);
-    ASSERT_EQ(out.g, 150);
-    ASSERT_EQ(out.b, 150);
-    ASSERT_EQ(out.a, 150);
+    u8 out[4];
+    read_pixel(0, 0, out);
+    ASSERT_EQ(out[0], 150);
+    ASSERT_EQ(out[1], 150);
+    ASSERT_EQ(out[2], 150);
+    ASSERT_EQ(out[3], 150);
 
     GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
 }
@@ -576,6 +495,37 @@ TEST(test_efb_copytex) {
     ASSERT_EQ(dest[14], 150); ASSERT_EQ(dest[15], 160);
 }
 
+// FIFO ordering: draw two quads with different state, verify both wrote correctly
+TEST(test_fifo_ordering) {
+    init_gx();
+
+    // First draw: write color (10, 20, 30, 40) at pixel (0, 0)
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+    draw_quad(0.0f, 0.0f, 1.0f, 1.0f, 10, 20, 30, 40);
+
+    // Second draw: write color (50, 60, 70, 80) at pixel (2, 0)
+    draw_quad(2.0f, 0.0f, 3.0f, 1.0f, 50, 60, 70, 80);
+
+    // Flush both draws
+    GX_DrawDone();
+
+    // Verify both pixels
+    u8 out1[4], out2[4];
+    read_pixel(0, 0, out1);
+    read_pixel(2, 0, out2);
+
+    ASSERT_EQ(out1[0], 10);
+    ASSERT_EQ(out1[1], 20);
+    ASSERT_EQ(out1[2], 30);
+    ASSERT_EQ(out1[3], 40);
+
+    ASSERT_EQ(out2[0], 50);
+    ASSERT_EQ(out2[1], 60);
+    ASSERT_EQ(out2[2], 70);
+    ASSERT_EQ(out2[3], 80);
+}
+
 int main() {
     printf("test_tev:\n");
     RUN(test_efb_poke_peek);
@@ -592,6 +542,7 @@ int main() {
     RUN(test_multi_pass_dot_product);
     RUN(test_efb_subtract_blend);
     RUN(test_efb_copytex);
+    RUN(test_fifo_ordering);
 
     printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;

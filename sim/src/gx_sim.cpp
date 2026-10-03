@@ -12,6 +12,20 @@
 #include <cstring>
 #include <vector>
 
+#ifdef GX_SIM_TIMING
+#include <chrono>
+#include <thread>
+static void sim_sleep_us(int us) {
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
+}
+static const int COPYTEX_LATENCY_US  = 500;  // ~0.5 ms pipeline flush + DMA
+static const int DRAWDONE_LATENCY_US = 100;  // ~0.1 ms pipeline drain
+#else
+static void sim_sleep_us(int) {}
+static const int COPYTEX_LATENCY_US  = 0;
+static const int DRAWDONE_LATENCY_US = 0;
+#endif
+
 // Internal state
 
 static const int MAX_TEV_STAGES = 16;
@@ -69,10 +83,9 @@ struct TextureState {
 };
 
 struct EFBPixel {
-    // Stored as signed 10-bit range (-1024..1023) to match TEV internal precision.
-    // On real hardware the EFB is 8-bit per channel after clamping, but we keep
-    // higher precision internally for chained TEV computations.
-    s16 r, g, b, a;
+    // EFB stores 8-bit per channel after TEV output clamping, matching real hardware.
+    // TEV internal precision is s10, but once written to EFB it's u8.
+    u8 r, g, b, a;
     u32 z;
 };
 
@@ -129,6 +142,30 @@ struct IndTexMatrix {
     f32 m[2][3];   // 2x3 offset matrix
     s8 scale_exp;  // power-of-2 scale exponent
     bool loaded;
+};
+
+// A draw command captured at GX_End() time. On real hardware the CPU writes
+// state changes and vertex data into the GX FIFO; the GPU processes them
+// asynchronously. We model this by snapshotting all pipeline state into a
+// DrawCommand, then processing the queue when GX_DrawDone() is called.
+struct DrawCommand {
+    u8 num_tev_stages;
+    TEVStageConfig tev_stages[MAX_TEV_STAGES];
+    GXColorS10 tev_regs[MAX_TEV_REGS];
+    GXColor konst_colors[MAX_KONST_COLORS];
+    SwapTable swap_tables[MAX_SWAP_TABLES];
+    TextureState textures[MAX_TEXMAPS];
+    u32 num_texgens;
+    TexGenConfig texgens[MAX_TEXGENS];
+    TexMatrix tex_matrices[MAX_TEXMTX];
+    u8 num_ind_stages;
+    IndTexStageConfig ind_stages[MAX_IND_STAGES];
+    IndTexMatrix ind_matrices[MAX_IND_MTX];
+    BlendState blend;
+    bool color_update_enabled;
+    bool alpha_update_enabled;
+    u8 primitive_type;
+    std::vector<VertexData> vertices;
 };
 
 // Global simulator state
@@ -190,6 +227,9 @@ static struct {
     u8 num_ind_stages;
     IndTexStageConfig ind_stages[MAX_IND_STAGES];
     IndTexMatrix ind_matrices[MAX_IND_MTX];
+
+    // FIFO draw queue: commands queued by GX_End(), flushed by GX_DrawDone()
+    std::vector<DrawCommand> draw_queue;
 
     // Initialized flag
     bool initialized;
@@ -507,8 +547,8 @@ static void blend_and_write(int px, int py, u8 frag_r, u8 frag_g, u8 frag_b, u8 
             if (blended < 0) blended = 0;
             if (blended > 255) blended = 255;
 
-            s16* dest = (ch == 0) ? &pixel.r : (ch == 1) ? &pixel.g : (ch == 2) ? &pixel.b : &pixel.a;
-            *dest = (s16)blended;
+            u8* dest = (ch == 0) ? &pixel.r : (ch == 1) ? &pixel.g : (ch == 2) ? &pixel.b : &pixel.a;
+            *dest = (u8)blended;
         }
         return;
     }
@@ -516,12 +556,12 @@ static void blend_and_write(int px, int py, u8 frag_r, u8 frag_g, u8 frag_b, u8 
     if (gx.blend.mode == GX_BM_SUBTRACT) {
         // out = dst - src, clamped to [0, 255]
         if (gx.color_update_enabled) {
-            pixel.r = (s16)std::max(0, (int)dst_r - (int)frag_r);
-            pixel.g = (s16)std::max(0, (int)dst_g - (int)frag_g);
-            pixel.b = (s16)std::max(0, (int)dst_b - (int)frag_b);
+            pixel.r = (u8)std::max(0, (int)dst_r - (int)frag_r);
+            pixel.g = (u8)std::max(0, (int)dst_g - (int)frag_g);
+            pixel.b = (u8)std::max(0, (int)dst_b - (int)frag_b);
         }
         if (gx.alpha_update_enabled) {
-            pixel.a = (s16)std::max(0, (int)dst_a - (int)frag_a);
+            pixel.a = (u8)std::max(0, (int)dst_a - (int)frag_a);
         }
         return;
     }
@@ -976,6 +1016,7 @@ void GX_Flush(void) {}
 
 void GX_DrawDone(void) {
     flush_vertices();
+    sim_sleep_us(DRAWDONE_LATENCY_US);
 }
 
 void GX_ClearVtxDesc(void) {
@@ -1373,6 +1414,7 @@ void GX_SetTexCopyDst(u16 wd, u16 ht, u32 fmt, u8) {
 }
 
 void GX_CopyTex(void* dest, u8 clear) {
+    sim_sleep_us(COPYTEX_LATENCY_US);
     // Copy EFB region to a texture buffer in memory
     u16 sx = gx.tex_copy_src.left;
     u16 sy = gx.tex_copy_src.top;
@@ -1396,8 +1438,8 @@ void GX_CopyTex(void* dest, u8 clear) {
         for (u16 y = 0; y < sh && (sy + y) < GX_EFB_HEIGHT; y++) {
             for (u16 x = 0; x < sw && (sx + x) < GX_EFB_WIDTH; x++) {
                 gx.efb[sy + y][sx + x] = {
-                    (s16)gx.clear_color.r, (s16)gx.clear_color.g,
-                    (s16)gx.clear_color.b, (s16)gx.clear_color.a,
+                    gx.clear_color.r, gx.clear_color.g,
+                    gx.clear_color.b, gx.clear_color.a,
                     gx.clear_z
                 };
             }

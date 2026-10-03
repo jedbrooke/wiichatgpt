@@ -10,11 +10,15 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 option(WII_MATH_BACKEND "Math backend: CPU or GX" "CPU")
+option(GX_SIM_TIMING "Enable simulated GPU latency (sleeps in DrawDone/CopyTex)" OFF)
 
 include_directories(include)
 
 # GX simulator library (only needed for GX backend and TEV tests)
 add_library(gx_sim STATIC src/gx_sim.cpp)
+if(GX_SIM_TIMING)
+    target_compile_definitions(gx_sim PUBLIC GX_SIM_TIMING=1)
+endif()
 
 # TEV tests (always uses the GX simulator directly)
 add_executable(test_tev tests/test_tev.cpp)
