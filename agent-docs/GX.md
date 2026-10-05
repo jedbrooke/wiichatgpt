@@ -26,7 +26,13 @@ GLOBAL STATE (configured by CPU via GX FIFO commands before each draw call):
   tev_stage[16].color_in  : (a,b,c,d)    # 4 input selectors, each from ~16 sources
   tev_stage[16].alpha_in  : (a,b,c,d)    # 4 input selectors, each from ~8 sources
   tev_stage[16].color_op  : (op, bias, scale, clamp, out_reg)
-  tev_stage[16].alpha_op  : (op, bias, scale, clamp, out_reg)
+                            #   op      : ADD or SUB
+                            #   bias    : TB_ZERO, TB_ADDHALF, TB_SUBHALF
+                            #   scale   : CS_SCALE_1, CS_SCALE_2, CS_SCALE_4, CS_DIVIDE_2
+                            #   clamp   : 1 = clamp to [0..255], 0 = clamp to [-1024..1023]
+                            #   out_reg : TEVPREV(0), TEVREG0(1), TEVREG1(2), or TEVREG2(3)
+  tev_stage[16].alpha_op  : (op, bias, scale, clamp, out_reg)   # same fields as color_op
+                            # color and alpha out_reg are independent per stage.
   tev_stage[16].tex_map   : u8            # which of 8 texture map slots
   tev_stage[16].tex_coord : u8            # which of 8 texcoord channels
   tev_stage[16].ras_chan  : u8            # which rasterized color channel
@@ -37,8 +43,15 @@ GLOBAL STATE (configured by CPU via GX FIFO commands before each draw call):
   tev_stage[16].ind_*     : ...           # indirect texture config (stage, matrix, format, etc.)
 
   # TEV register file (persistent across stages within a fragment, reset per draw setup)
-  tev_regs[4]             : s10[4]        # TEVPREV, TEVREG0, TEVREG1, TEVREG2
-                                          # each is (R, G, B, A) in [-1024..1023]
+  tev_regs[4]             : s10[4]        # 4 registers, each (R, G, B, A) in [-1024..1023]:
+                                          #   [0] = TEVPREV  (default output target)
+                                          #   [1] = TEVREG0  (auxiliary register)
+                                          #   [2] = TEVREG1  (auxiliary register)
+                                          #   [3] = TEVREG2  (auxiliary register)
+                                          # All 4 are readable as color/alpha inputs (via mux)
+                                          # and writable as color_op/alpha_op output targets.
+                                          # Initialized per-fragment from CPU-preloaded values.
+                                          # PE always reads TEVPREV as the final fragment color.
 
   # Konst colors (loaded by CPU)
   konst_colors[4]         : u8[4]         # K0..K3, each RGBA
@@ -409,6 +422,30 @@ helpers:
             GX_CA_RASA   (5):  return ras_color[3]               # u8
             GX_CA_KONST  (6):  return konst_a                    # u8
             GX_CA_ZERO   (7):  return 0                          # constant 0.0
+
+# TEV Register File: Read/Write Map
+#
+# READS (as color inputs via mux_color):
+#   GX_CC_CPREV -> tev_regs[TEVPREV].rgb     GX_CC_APREV -> tev_regs[TEVPREV].a
+#   GX_CC_C0    -> tev_regs[TEVREG0].rgb     GX_CC_A0    -> tev_regs[TEVREG0].a
+#   GX_CC_C1    -> tev_regs[TEVREG1].rgb     GX_CC_A1    -> tev_regs[TEVREG1].a
+#   GX_CC_C2    -> tev_regs[TEVREG2].rgb     GX_CC_A2    -> tev_regs[TEVREG2].a
+#
+# READS (as alpha inputs via mux_alpha):
+#   GX_CA_APREV -> tev_regs[TEVPREV].a
+#   GX_CA_A0    -> tev_regs[TEVREG0].a
+#   GX_CA_A1    -> tev_regs[TEVREG1].a
+#   GX_CA_A2    -> tev_regs[TEVREG2].a
+#
+# WRITES (per stage, after combine+clamp):
+#   color_op.out_reg selects which register receives the R,G,B result
+#   alpha_op.out_reg selects which register receives the A result
+#   These are independent: a stage can write color to TEVREG1 and alpha to TEVPREV.
+#
+# FINAL OUTPUT:
+#   After all stages, PE reads tev_regs[TEVPREV] as the fragment color.
+#   If the last stage wrote to a register other than TEVPREV, that result
+#   is NOT forwarded: PE always reads TEVPREV unconditionally.
 
 # Process each fragment through the TEV pipeline (4 pixel pipes in parallel on real HW)
 for f in 0..M-1:
