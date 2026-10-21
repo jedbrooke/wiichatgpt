@@ -41,58 +41,53 @@ where x is matmul and + is elementwise add
 [ AA AB ] x [ BA BB ] = [ (AA x BA) + (AB x BC)  (AA x BB) + (AB x BD)]
 [ AC AD ]   [ BC BD ]   [ (AC x BA) + (AD x BC)  (AD x BB) + (AD x BD)]
 
-8,4 RGBA4 texture 
-tex0: [ AA_0 AA_1 AA_2 AA_3 | AA_4 AA_5 AA_6 AA_7 | AB_0 AB_1 AB_2 AB_3 | AB_4 AB_5 AB_6 AB_7 | AA_0 AA_1 AA_2 AA_3 | AA_4 AA_5 AA_6 AA_7 | AB_0 AB_1 AB_2 AB_3 | AB_4 AB_5 AB_6 AB_7
-        AA_8 AA_9 AA_A AA_B | AA_C AA_D AA_E AA_F | AB_8 AB_9 AB_A AB_B | AB_C AB_D AB_E AB_F | AA_8 AA_9 AA_A AA_B | AA_C AA_D AA_E AA_F | AB_8 AB_9 AB_A AB_B | AB_C AB_D AB_E AB_F 
-        AC_0 AC_1 AC_2 AC_3 | AC_4 AC_5 AC_6 AC_7 | AD_0 AD_1 AD_2 AD_3 | AD_4 AD_5 AD_6 AD_7 | AC_0 AC_1 AC_2 AC_3 | AC_4 AC_5 AC_6 AC_7 | AD_0 AD_1 AD_2 AD_3 | AD_4 AD_5 AD_6 AD_7
-        AC_8 AC_9 AC_A AC_B | AC_C AC_D AC_E AC_F | AD_8 AD_9 AD_A AD_B | AD_C AD_D AD_E AD_F | AC_8 AC_9 AC_A AC_B | AC_C AC_D AC_E AC_F | AD_8 AD_9 AD_A AD_B | AD_C AD_D AD_E AD_F ]
-4,2 RGBA texture
-tex1: [ BA_0 BA_1 BA_2 BA_3 | BC_0 BC_1 BC_2 BC_3 | BB_0 BB_1 BB_2 BB_3 | BD_0 BD_1 BD_2 BD_3
-        BA_0 BA_1 BA_2 BA_3 | BC_0 BC_1 BC_2 BC_3 | BB_0 BB_1 BB_2 BB_3 | BD_0 BD_1 BD_2 BD_3 ]
-tex2: [ BA_4 BA_5 BA_6 BA_7 | BC_4 BC_5 BC_6 BC_7 | BB_4 BB_5 BB_6 BB_7 | BD_4 BD_5 BD_6 BD_7
-        BA_4 BA_5 BA_6 BA_7 | BC_4 BC_5 BC_6 BC_7 | BB_4 BB_5 BB_6 BB_7 | BD_4 BD_5 BD_6 BD_7 ] 
-tex3: [ BA_8 BA_9 BA_A BA_B | BC_8 BC_9 BC_A BC_B | BB_8 BB_9 BB_A BB_B | BD_8 BD_9 BD_A BD_B
-        BA_8 BA_9 BA_A BA_B | BC_8 BC_9 BC_A BC_B | BB_8 BB_9 BB_A BB_B | BD_8 BD_9 BD_A BD_B ] 
-tex4: [ BA_C BA_D BA_E BA_F | BC_C BC_D BC_E BC_F | BB_C BB_D BB_E BB_F | BD_C BD_D BD_E BD_F
-        BA_C BA_D BA_E BA_F | BC_C BC_D BC_E BC_F | BB_C BB_D BB_E BB_F | BD_C BD_D BD_E BD_F ]
+A: 4,4 RGBA texture
+tex0: [ AA_0 AA_1 AA_2 AA_3 | AC_0 AC_1 AC_2 AC_3 | AB_0 AB_1 AB_2 AB_3 | AD_0 AD_1 AD_2 AD_3 
+        AA_4 AA_5 AA_6 AA_7 | AC_4 AC_5 AC_6 AC_7 | AB_4 AB_5 AB_6 AB_7 | AD_4 AD_5 AD_6 AD_7
+        AA_8 AA_9 AA_A AA_B | AC_8 AC_9 AC_A AC_B | AB_8 AB_9 AB_A AB_B | AD_8 AD_9 AD_A AD_B
+        AA_C AA_D AA_E AA_F | AC_C AC_D AC_E AC_F | AB_C AB_D AB_E AB_F | AD_C AD_D AD_E AD_F ]
 
-8,4
-EFB = [ (AA x BA) | (AB x BC) | (AA x BB) | (AB x BD) ]
-      [ (AC x BA) | (AD x BC) | (AD x BB) | (AD x BD) ]
-
-in theory our actual mem requirement is only 4,4 for A and 4x 2,2 for B = 32, compared to 64 now (A and B are needed twice). but we'd still need 8,4 output. 
-stretch tex0 [x, 2 * y], stretch tex1-4 [2 * x, 2 * y].
-Stretching Btex on y is easy, since that's a straigh dupliate, we already do it for x. Stretching A tex presents an issue, since we need to repeat rather than just a simple stretch. Or if we stretch A and B together then it just does the same computation again, not actualy crossing A and B. We could use a indirect texture lookup, or maybe mess around with INT8 vs RGBA8 texture type.
-This might just be premature optimization though, since B already gives us half of the improvement. We might not even be memory bandwidth bound
-
-4,4 RGBA4 texture 
-tex0: [ AA_0 AA_1 AA_2 AA_3 | AA_4 AA_5 AA_6 AA_7 | AB_0 AB_1 AB_2 AB_3 | AB_4 AB_5 AB_6 AB_7 |
-        AA_8 AA_9 AA_A AA_B | AA_C AA_D AA_E AA_F | AB_8 AB_9 AB_A AB_B | AB_C AB_D AB_E AB_F | 
-        AC_0 AC_1 AC_2 AC_3 | AC_4 AC_5 AC_6 AC_7 | AD_0 AD_1 AD_2 AD_3 | AD_4 AD_5 AD_6 AD_7 |
-        AC_8 AC_9 AC_A AC_B | AC_C AC_D AC_E AC_F | AD_8 AD_9 AD_A AD_B | AD_C AD_D AD_E AD_F ]
-8,1 GX_TF_IA8 texture
-tex1: [ BA_0 BA_1 | BA_2 `BA_3 | BC_0 BC_1 | BC_2 BC_3 | BB_0 BB_1 | BB_2 BB_3 | BD_0 BD_1 | BD_2 BD_3 ]
-tex2: [ BA_4 BA_5 | BA_6 BA_7 | BC_4 BC_5 | BC_6 BC_7 | BB_4 BB_5 | BB_6 BB_7 | BD_4 BD_5 | BD_6 BD_7 ]
-tex3: [ BA_8 BA_9 | BA_A BA_B | BC_8 BC_9 | BC_A BC_B | BB_8 BB_9 | BB_A BB_B | BD_8 BD_9 | BD_A BD_B ]
-tex4: [ BA_C BA_D | BA_E BA_F | BC_C BC_D | BC_E BC_F | BB_C BB_D | BB_E BB_F | BD_C BD_D | BD_E BD_F ]
+B: 2,2 RGBA texture
+tex1: [BA_0 BA_1 BA_2 BA_3]
 
 
-Stage 0: TEV_PREV = swap_tables tex0[x/2,y][R] 
-Stage 1: TEV_PREV = TEV_PREV * tex1[x/2,y/4]  # [ (AA_0 * BA_0) .. | (AA_4 * BA_0) .. | (AB_0 * BC_0) .. | .. |
-                                                  (AA_8 * BA_0) .. | (AA_C * BA_0) .. | (AB_8 * BC_0) .. | .. |
-                                                  (AC_0 * BA_0) .. | (AC_4 * BA_0) .. | (AB_0 * BC_0) .. | .. |
-                                                  (AC_8 * BA_0) .. | (AC_C * BA_0) .. | (AB_8 * BC_0) .. | .. | ]
-Stage 2: TEV_REG1 = swap_tables tex0[x/2,y][G]
-Stage 3: TEV_PREV += TEV_REG1 * tex2[x/2,y/4] 
-Stage 4: TEV_REG1 = swap_tables tex0[x/2,y][B]
-Stage 5: TEV_PREV += TEV_REG1 * tex3[x/2,y/4] 
-Stage 6: TEV_REG1 = swap_tables tex0[x/2,y][A]
-Stage 7: TEV_PREV += TEV_REG1 * tex4[x/2,y/4] 
-Stage 8: TEV_PREV /= 2
-Stage 9: TEV_PREV /= 2
 
-8,4
-final EFB: [ P0_0 P0_1 P0_2 P0_3 | P0_4 P0_5 P0_6 P0_7 | P1_0 P1_1 P1_2 P1_3 | P1_4 P1_5 P1_6 P1_7 | P2_0 P2_1 P2_2 P2_3 | P2_4 P2_5 P2_6 P2_7 | P3_0 P3_1 P3_2 P3_3 | P3_4 P3_5 P3_6 P3_7 |
-             P0_8 P0_9 P0_A P0_B | P0_C P0_D P0_E P0_F | P1_8 P1_9 P1_A P1_B | P1_C P1_D P1_E P1_F | P2_8 P2_9 P2_A P2_B | P2_C P2_D P2_E P2_F | P3_8 P3_9 P3_A P3_B | P3_C P3_D P3_E P3_F |
-             P4_0 P4_1 P4_2 P4_3 | P4_4 P4_5 P4_6 P4_7 | P5_0 P5_1 P5_2 P5_3 | P5_4 P5_5 P5_6 P5_7 | P6_0 P6_1 P6_2 P6_3 | P6_4 P6_5 P6_6 P6_7 | P7_0 P7_1 P7_2 P7_3 | P7_4 P7_5 P7_6 P7_7 |
-             P4_8 P4_9 P4_A P4_B | P4_C P4_D P4_E P4_F | P5_8 P5_9 P5_A P5_B | P5_C P5_D P5_E P5_F | P6_8 P6_9 P6_A P6_B | P6_C P6_D P6_E P6_F | P7_8 P7_9 P7_A P7_B | P7_C P7_D P7_E P7_F ]
+
+write it all out 
+AA_0 * BA_0 AA_1 * BA_4 AA_2 * BA_8 AA_3 * BA_C | AC_0 * BA_0 AC_1 * BA_4 AC_2 * BA_8 AC_3 * BA_C | AB_0 * BC_0 AB_1 * BC_4 AB_2 * BC_8 AB_3 * BC_C | AD_0 * BC_0 AD_1 * BC_4 AD_2 * BC_8 AD_3 * BC_C
+AA_0 * BA_1 AA_1 * BA_5 AA_2 * BA_9 AA_3 * BA_D | AC_0 * BA_1 AC_1 * BA_5 AC_2 * BA_9 AC_3 * BA_D | AB_0 * BC_1 AB_1 * BC_5 AB_2 * BC_9 AB_3 * BC_D | AD_0 * BC_1 AD_1 * BC_5 AD_2 * BC_9 AD_3 * BC_D
+AA_0 * BA_2 AA_1 * BA_6 AA_2 * BA_A AA_3 * BA_E | AC_0 * BA_2 AC_1 * BA_6 AC_2 * BA_A AC_3 * BA_E | AB_0 * BC_2 AB_1 * BC_6 AB_2 * BC_A AB_3 * BC_E | AD_0 * BC_2 AD_1 * BC_6 AD_2 * BC_A AD_3 * BC_E
+AA_0 * BA_3 AA_1 * BA_7 AA_2 * BA_B AA_3 * BA_F | AC_0 * BA_3 AC_1 * BA_7 AC_2 * BA_B AC_3 * BA_F | AB_0 * BC_3 AB_1 * BC_7 AB_2 * BC_B AB_3 * BC_F | AD_0 * BC_3 AD_1 * BC_7 AD_2 * BC_B AD_3 * BC_F
+AA_0 * BB_0 AA_1 * BB_4 AA_2 * BB_8 AA_3 * BB_C | AC_0 * BB_0 AC_1 * BB_4 AC_2 * BB_8 AC_3 * BB_C | AB_0 * BD_0 AB_1 * BD_4 AB_2 * BD_8 AB_3 * BD_C | AD_0 * BD_0 AD_1 * BD_4 AD_2 * BD_8 AD_3 * BD_C
+AA_0 * BB_1 AA_1 * BB_5 AA_2 * BB_9 AA_3 * BB_D | AC_0 * BB_1 AC_1 * BB_5 AC_2 * BB_9 AC_3 * BB_D | AB_0 * BD_1 AB_1 * BD_5 AB_2 * BD_9 AB_3 * BD_D | AD_0 * BD_1 AD_1 * BD_5 AD_2 * BD_9 AD_3 * BD_D
+AA_0 * BB_2 AA_1 * BB_6 AA_2 * BB_A AA_3 * BB_E | AC_0 * BB_2 AC_1 * BB_6 AC_2 * BB_A AC_3 * BB_E | AB_0 * BD_2 AB_1 * BD_6 AB_2 * BD_A AB_3 * BD_E | AD_0 * BD_2 AD_1 * BD_6 AD_2 * BD_A AD_3 * BD_E
+AA_0 * BB_3 AA_1 * BB_7 AA_2 * BB_B AA_3 * BB_F | AC_0 * BB_3 AC_1 * BB_7 AC_2 * BB_B AC_3 * BB_F | AB_0 * BD_3 AB_1 * BD_7 AB_2 * BD_B AB_3 * BD_F | AD_0 * BD_3 AD_1 * BD_7 AD_2 * BD_B AD_3 * BD_F
+
+AA_4 * BA_0 AA_5 * BA_4 AA_6 * BA_8 AA_7 * BA_C | AC_4 * BA_0 AC_5 * BA_4 AC_6 * BA_8 AC_7 * BA_C | AB_4 * BC_0 AB_5 * BC_4 AB_6 * BC_8 AB_7 * BC_C | AD_4 * BC_0 AD_5 * BC_4 AD_6 * BC_8 AD_7 * BC_C
+AA_4 * BA_1 AA_5 * BA_5 AA_6 * BA_9 AA_7 * BA_D | AC_4 * BA_1 AC_5 * BA_5 AC_6 * BA_9 AC_7 * BA_D | AB_4 * BC_1 AB_5 * BC_5 AB_6 * BC_9 AB_7 * BC_D | AD_4 * BC_1 AD_5 * BC_5 AD_6 * BC_9 AD_7 * BC_D
+AA_4 * BA_2 AA_5 * BA_6 AA_6 * BA_A AA_7 * BA_E | AC_4 * BA_2 AC_5 * BA_6 AC_6 * BA_A AC_7 * BA_E | AB_4 * BC_2 AB_5 * BC_6 AB_6 * BC_A AB_7 * BC_E | AD_4 * BC_2 AD_5 * BC_6 AD_6 * BC_A AD_7 * BC_E
+AA_4 * BA_3 AA_5 * BA_7 AA_6 * BA_B AA_7 * BA_F | AC_4 * BA_3 AC_5 * BA_7 AC_6 * BA_B AC_7 * BA_F | AB_4 * BC_3 AB_5 * BC_7 AB_6 * BC_B AB_7 * BC_F | AD_4 * BC_3 AD_5 * BC_7 AD_6 * BC_B AD_7 * BC_F
+AA_4 * BB_0 AA_5 * BB_4 AA_6 * BB_8 AA_7 * BB_C | AC_4 * BB_0 AC_5 * BB_4 AC_6 * BB_8 AC_7 * BB_C | AB_4 * BD_0 AB_5 * BD_4 AB_6 * BD_8 AB_7 * BD_C | AD_4 * BD_0 AD_5 * BD_4 AD_6 * BD_8 AD_7 * BD_C
+AA_4 * BB_1 AA_5 * BB_5 AA_6 * BB_9 AA_7 * BB_D | AC_4 * BB_1 AC_5 * BB_5 AC_6 * BB_9 AC_7 * BB_D | AB_4 * BD_1 AB_5 * BD_5 AB_6 * BD_9 AB_7 * BD_D | AD_4 * BD_1 AD_5 * BD_5 AD_6 * BD_9 AD_7 * BD_D
+AA_4 * BB_2 AA_5 * BB_6 AA_6 * BB_A AA_7 * BB_E | AC_4 * BB_2 AC_5 * BB_6 AC_6 * BB_A AC_7 * BB_E | AB_4 * BD_2 AB_5 * BD_6 AB_6 * BD_A AB_7 * BD_E | AD_4 * BD_2 AD_5 * BD_6 AD_6 * BD_A AD_7 * BD_E
+AA_4 * BB_3 AA_5 * BB_7 AA_6 * BB_B AA_7 * BB_F | AC_4 * BB_3 AC_5 * BB_7 AC_6 * BB_B AC_7 * BB_F | AB_4 * BD_3 AB_5 * BD_7 AB_6 * BD_B AB_7 * BD_F | AD_4 * BD_3 AD_5 * BD_7 AD_6 * BD_B AD_7 * BD_F
+
+AA_8 * BA_0 AA_9 * BA_4 AA_A * BA_8 AA_B * BA_C | AC_8 * BA_0 AC_9 * BA_4 AC_A * BA_8 AC_B * BA_C | AB_8 * BC_0 AB_9 * BC_4 AB_A * BC_8 AB_B * BC_C | AD_8 * BC_0 AD_9 * BC_4 AD_A * BC_8 AD_B * BC_C
+AA_8 * BA_1 AA_9 * BA_5 AA_A * BA_9 AA_B * BA_D | AC_8 * BA_1 AC_9 * BA_5 AC_A * BA_9 AC_B * BA_D | AB_8 * BC_1 AB_9 * BC_5 AB_A * BC_9 AB_B * BC_D | AD_8 * BC_1 AD_9 * BC_5 AD_A * BC_9 AD_B * BC_D
+AA_8 * BA_2 AA_9 * BA_6 AA_A * BA_A AA_B * BA_E | AC_8 * BA_2 AC_9 * BA_6 AC_A * BA_A AC_B * BA_E | AB_8 * BC_2 AB_9 * BC_6 AB_A * BC_A AB_B * BC_E | AD_8 * BC_2 AD_9 * BC_6 AD_A * BC_A AD_B * BC_E
+AA_8 * BA_3 AA_9 * BA_7 AA_A * BA_B AA_B * BA_F | AC_8 * BA_3 AC_9 * BA_7 AC_A * BA_B AC_B * BA_F | AB_8 * BC_3 AB_9 * BC_7 AB_A * BC_B AB_B * BC_F | AD_8 * BC_3 AD_9 * BC_7 AD_A * BC_B AD_B * BC_F
+AA_8 * BB_0 AA_9 * BB_4 AA_A * BB_8 AA_B * BB_C | AC_8 * BB_0 AC_9 * BB_4 AC_A * BB_8 AC_B * BB_C | AB_8 * BD_0 AB_9 * BD_4 AB_A * BD_8 AB_B * BD_C | AD_8 * BD_0 AD_9 * BD_4 AD_A * BD_8 AD_B * BD_C
+AA_8 * BB_1 AA_9 * BB_5 AA_A * BB_9 AA_B * BB_D | AC_8 * BB_1 AC_9 * BB_5 AC_A * BB_9 AC_B * BB_D | AB_8 * BD_1 AB_9 * BD_5 AB_A * BD_9 AB_B * BD_D | AD_8 * BD_1 AD_9 * BD_5 AD_A * BD_9 AD_B * BD_D
+AA_8 * BB_2 AA_9 * BB_6 AA_A * BB_A AA_B * BB_E | AC_8 * BB_2 AC_9 * BB_6 AC_A * BB_A AC_B * BB_E | AB_8 * BD_2 AB_9 * BD_6 AB_A * BD_A AB_B * BD_E | AD_8 * BD_2 AD_9 * BD_6 AD_A * BD_A AD_B * BD_E
+AA_8 * BB_3 AA_9 * BB_7 AA_A * BB_B AA_B * BB_F | AC_8 * BB_3 AC_9 * BB_7 AC_A * BB_B AC_B * BB_F | AB_8 * BD_3 AB_9 * BD_7 AB_A * BD_B AB_B * BD_F | AD_8 * BD_3 AD_9 * BD_7 AD_A * BD_B AD_B * BD_F
+
+AA_C * BA_0 AA_D * BA_4 AA_E * BA_8 AA_F * BA_C | AC_C * BA_0 AC_D * BA_4 AC_E * BA_8 AC_F * BA_C | AB_C * BC_0 AB_D * BC_4 AB_E * BC_8 AB_F * BC_C | AD_C * BC_0 AD_D * BC_4 AD_E * BC_8 AD_F * BC_C
+AA_C * BA_1 AA_D * BA_5 AA_E * BA_9 AA_F * BA_D | AC_C * BA_1 AC_D * BA_5 AC_E * BA_9 AC_F * BA_D | AB_C * BC_1 AB_D * BC_5 AB_E * BC_9 AB_F * BC_D | AD_C * BC_1 AD_D * BC_5 AD_E * BC_9 AD_F * BC_D
+AA_C * BA_2 AA_D * BA_6 AA_E * BA_A AA_F * BA_E | AC_C * BA_2 AC_D * BA_6 AC_E * BA_A AC_F * BA_E | AB_C * BC_2 AB_D * BC_6 AB_E * BC_A AB_F * BC_E | AD_C * BC_2 AD_D * BC_6 AD_E * BC_A AD_F * BC_E
+AA_C * BA_3 AA_D * BA_7 AA_E * BA_B AA_F * BA_F | AC_C * BA_3 AC_D * BA_7 AC_E * BA_B AC_F * BA_F | AB_C * BC_3 AB_D * BC_7 AB_E * BC_B AB_F * BC_F | AD_C * BC_3 AD_D * BC_7 AD_E * BC_B AD_F * BC_F
+AA_C * BB_0 AA_D * BB_4 AA_E * BB_8 AA_F * BB_C | AC_C * BB_0 AC_D * BB_4 AC_E * BB_8 AC_F * BB_C | AB_C * BD_0 AB_D * BD_4 AB_E * BD_8 AB_F * BD_C | AD_C * BD_0 AD_D * BD_4 AD_E * BD_8 AD_F * BD_C
+AA_C * BB_1 AA_D * BB_5 AA_E * BB_9 AA_F * BB_D | AC_C * BB_1 AC_D * BB_5 AC_E * BB_9 AC_F * BB_D | AB_C * BD_1 AB_D * BD_5 AB_E * BD_9 AB_F * BD_D | AD_C * BD_1 AD_D * BD_5 AD_E * BD_9 AD_F * BD_D
+AA_C * BB_2 AA_D * BB_6 AA_E * BB_A AA_F * BB_E | AC_C * BB_2 AC_D * BB_6 AC_E * BB_A AC_F * BB_E | AB_C * BD_2 AB_D * BD_6 AB_E * BD_A AB_F * BD_E | AD_C * BD_2 AD_D * BD_6 AD_E * BD_A AD_F * BD_E
+AA_C * BB_3 AA_D * BB_7 AA_E * BB_B AA_F * BB_F | AC_C * BB_3 AC_D * BB_7 AC_E * BB_B AC_F * BB_F | AB_C * BD_3 AB_D * BD_7 AB_E * BD_B AB_F * BD_F | AD_C * BD_3 AD_D * BD_7 AD_E * BD_B AD_F * BD_F
+
+
