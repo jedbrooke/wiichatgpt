@@ -5,3 +5,12 @@
 4. we'll probably do a fork of llama.cpp (we'll briefly explore other inference stacks too, potentially even from scratch if needed) with a custom kernel for the wii gpu.
 5. model will be a custom trained model (or fine tune), around 1B, likely INT8/4 (wii lacks any fp16 etc, only has fp32 which is likely too slow). Instead of going for a general purpose model, we plan to train/fine-tune a model on wii trivia, popular wii games, etc. prob yoink some wikis (jake can handle the training)
 6. basic chat interface, prob use some graphics lib (maybe SDL 1/2? idk the wii brew scene but I know older SDL supports wii) that will give us usb keyboard for free, but for the *authentic* wii experience, text will be entered with an on screen keyboard and the wii pointer, just as Nintendo intended. 
+
+## Install
+follow instructions on https://devkitpro.org/wiki/devkitPro_pacman
+
+
+## Progress
+- [untested] software gpu api simlation layer
+- [] in ram dense model inference using simulation layer
+- [] PLE inference stack
