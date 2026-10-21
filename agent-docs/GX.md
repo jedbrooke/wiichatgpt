@@ -40,7 +40,17 @@ GLOBAL STATE (configured by CPU via GX FIFO commands before each draw call):
   tev_stage[16].kasel     : u8            # konst alpha selector
   tev_stage[16].ras_swap  : u8            # swap table index for raster color
   tev_stage[16].tex_swap  : u8            # swap table index for texture color
-  tev_stage[16].ind_*     : ...           # indirect texture config (stage, matrix, format, etc.)
+  # Per-TEV-stage indirect texture config (BPMEM_IND_CMD, 21-bit register per stage)
+  tev_stage[16].ind_stage      : u2   # which ind_stages[] entry (0-3) to sample
+  tev_stage[16].ind_format     : u2   # texel precision: ITF_8(shift 0), ITF_5(3), ITF_4(4), ITF_3(5)
+  tev_stage[16].ind_bias_sel   : u3   # offset bias bitmask: bit0=S, bit1=T, bit2=U
+  tev_stage[16].ind_bs         : u2   # bump alpha source: OFF, S, T, or U
+  tev_stage[16].ind_matrix_sel : u2   # which indirect matrix: OFF, 0, 1, or 2
+  tev_stage[16].ind_matrix_id  : u2   # matrix interpretation: INDIRECT, S, or T
+  tev_stage[16].ind_wrap_s     : u3   # S-coord wrap: OFF, 256, 128, 64, 32, 16, 0
+  tev_stage[16].ind_wrap_t     : u3   # T-coord wrap: OFF, 256, 128, 64, 32, 16, 0
+  tev_stage[16].ind_utclod     : u1   # 1=use unmodified texcoord for LOD
+  tev_stage[16].ind_addprev    : u1   # 1=add previous stage indirect offset
 
   # TEV register file (persistent across stages within a fragment, reset per draw setup)
   tev_regs[4]             : s10[4]        # 4 registers, each (R, G, B, A) in [-1024..1023]:
@@ -66,10 +76,10 @@ GLOBAL STATE (configured by CPU via GX FIFO commands before each draw call):
   textures[8].format      : enum          # I8, IA8, RGB565, RGBA8, etc.
   textures[8].wrap_s/t    : enum          # CLAMP, REPEAT, MIRROR
 
-  # Indirect texture state
-  ind_stages[4].tex_coord : u8
-  ind_stages[4].tex_map   : u8
-  ind_stages[4].scale_s/t : u8
+  # Indirect texture state (configured via BPMEM_IREF and BPMEM_RAS1_SS0/SS1)
+  ind_stages[4].tex_coord : u8   # 3 bits: which XF texgen channel (0-7) provides coords for this indirect lookup
+  ind_stages[4].tex_map   : u8   # 3 bits: which texture map slot (0-7) to sample for this indirect lookup
+  ind_stages[4].scale_s/t : u8   # 4 bits each: pre-scale texcoords before indirect lookup, scale = 2^(-val)
   ind_matrices[3]         : f32[2][3]     # 2x3 offset matrix
   ind_matrices[3].scale   : s8            # power-of-2 exponent
 
@@ -459,6 +469,11 @@ for f in 0..M-1:
         cfg = tev_stage[stage]
 
         # --- INDIRECT TEXTURE (optional, per stage) ---
+        # ind_enable is a pseudocode convenience, not a hardware bit.
+        # Hardware condition (Dolphin TevStageIndirect::IsActive()):
+        #   active = (ind_bs != OFF) or (ind_matrix_sel != OFF)
+        # When neither bump alpha nor an indirect matrix is selected,
+        # the indirect texture sample has no effect and is skipped.
         if cfg.ind_enable:
             ist = ind_stages[cfg.ind_stage]
             ind_texel = texture_sample(ist.tex_map, texcoords_f[ist.tex_coord])  : u8[4]
