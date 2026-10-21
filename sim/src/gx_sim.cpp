@@ -256,9 +256,15 @@ static void sample_texture(u8 texmap, f32 s, f32 t, u8 out[4]) {
         return;
     }
 
-    // s, t are in [0..1] range
-    int ix = (int)(s * tex.width);
-    int iy = (int)(t * tex.height);
+    // s, t are in [0..1] range. Convert to texel index.
+    // Standard mapping: texel i covers s in [i/width, (i+1)/width).
+    // fp32 interpolation across large quads can produce values like 0.499999
+    // instead of 0.5, causing off-by-one. We add a small epsilon (half a texel
+    // in the s17.7 fixed-point space used by real hardware) to bias toward the
+    // correct texel.
+    f32 eps = 0.5f / 256.0f;  // ~half an s17.7 LSB
+    int ix = (int)floorf(s * tex.width + eps);
+    int iy = (int)floorf(t * tex.height + eps);
 
     // Wrap
     if (tex.wrap_s == GX_CLAMP) {

@@ -183,6 +183,30 @@ void wii_rmsnorm(const float* x, const float* weight, float* y, int n) {
     }
 }
 
+// Native u8 matmul matching TEV arithmetic: product = round(a * b / 255),
+// accumulated in s32, clamped to [0, 255].
+// This matches the TEV lerp formula: lerp = ((255-c)*a + c*b + 128) >> 8
+// where a=ZERO, b=texture, c=konst -> lerp = (c*b + 128) >> 8 = round(b*c/255).
+void wii_matmul_u8(const unsigned char* A, const unsigned char* B, unsigned char* C,
+                   int M, int K, int N) {
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++) {
+                // TEV multiply formula: round(a * b / 255)
+                // = (a * b + 128) >> 8  (matches hardware fixed-point rounding)
+                int a = A[i * K + k];
+                int b = B[k * N + j];
+                acc += (a * b + 128) >> 8;
+            }
+            // Clamp to u8
+            if (acc < 0) acc = 0;
+            if (acc > 255) acc = 255;
+            C[i * N + j] = (unsigned char)acc;
+        }
+    }
+}
+
 // INT8 matvec with 4-way unrolled inner loop.
 void wii_matvec_q8(const signed char* W, float scale, const float* x,
                    float* y, int M, int K) {

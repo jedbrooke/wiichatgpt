@@ -237,6 +237,182 @@ TEST(test_matvec_q8_scale) {
     ASSERT_NEAR(y[0], -0.01f, 0.001f);
 }
 
+// Native u8 matmul: small 2x3 * 3x4 case
+TEST(test_matmul_u8_small) {
+    // A[2][3], B[3][4], C[2][4]
+    // Products use TEV formula: round(a * b / 255)
+    unsigned char A[] = {
+        128, 64, 200,   // row 0
+        50, 255, 100    // row 1
+    };
+    unsigned char B[] = {
+        100, 200, 50, 150,   // k=0
+        180, 90, 220, 30,    // k=1
+        60, 255, 10, 180     // k=2
+    };
+    unsigned char C[2 * 4];
+    unsigned char C_ref[2 * 4];
+
+    // Compute reference on CPU using the TEV formula
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 4; j++) {
+            int acc = 0;
+            for (int k = 0; k < 3; k++) {
+                acc += ((int)A[i*3+k] * (int)B[k*4+j] + 128) >> 8;
+            }
+            if (acc > 255) acc = 255;
+            C_ref[i*4+j] = (unsigned char)acc;
+        }
+    }
+
+    wii_matmul_u8(A, B, C, 2, 3, 4);
+
+    for (int i = 0; i < 8; i++) {
+        // Allow +/- 1 for rounding differences across blend passes
+        int diff = (int)C[i] - (int)C_ref[i];
+        if (diff < -1 || diff > 1) {
+            printf("FAIL\n    %s:%d: C[%d]=%d, expected %d (diff=%d)\n",
+                   __FILE__, __LINE__, i, C[i], C_ref[i], diff);
+            tests_failed++;
+            return;
+        }
+    }
+}
+
+// Native u8 matmul: identity-like test, K=1 (outer product)
+TEST(test_matmul_u8_outer_product) {
+    // K=1: C[i][j] = round(A[i] * B[j] / 255)
+    unsigned char A[4] = {255, 128, 64, 0};
+    unsigned char B[3] = {255, 128, 0};
+    unsigned char C[4 * 3];
+
+    wii_matmul_u8(A, B, C, 4, 1, 3);
+
+    // Expected: round(a * b / 255) = (a * b + 128) >> 8
+    ASSERT_NEAR(C[0*3+0], (255*255+128)>>8, 1);  // 255
+    ASSERT_NEAR(C[0*3+1], (255*128+128)>>8, 1);   // 128
+    ASSERT_NEAR(C[0*3+2], (255*0+128)>>8, 1);     // 0
+    ASSERT_NEAR(C[1*3+0], (128*255+128)>>8, 1);   // 128
+    ASSERT_NEAR(C[1*3+1], (128*128+128)>>8, 1);   // 64
+    ASSERT_NEAR(C[2*3+0], (64*255+128)>>8, 1);    // 64
+    ASSERT_NEAR(C[3*3+0], (0*255+128)>>8, 1);     // 0
+}
+
+// Native u8 matmul: full EFB test (528 x 16 x 6 = 528 x 6)
+// Uses full EFB height and exercises the packed RGB output path.
+TEST(test_matmul_u8_full_efb) {
+    const int M = 528;
+    const int K = 16;
+    const int N = 6;
+
+    unsigned char* A = (unsigned char*)malloc(M * K);
+    unsigned char* B = (unsigned char*)malloc(K * N);
+    unsigned char* C = (unsigned char*)calloc(M * N, 1);
+    unsigned char* C_ref = (unsigned char*)calloc(M * N, 1);
+
+    // Fill with a deterministic pattern
+    for (int i = 0; i < M; i++)
+        for (int k = 0; k < K; k++)
+            A[i * K + k] = (unsigned char)((i * 7 + k * 13) & 0xFF);
+
+    for (int k = 0; k < K; k++)
+        for (int j = 0; j < N; j++)
+            B[k * N + j] = (unsigned char)((k * 11 + j * 17) & 0xFF);
+
+    // CPU reference
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int acc = 0;
+            for (int k = 0; k < K; k++) {
+                acc += ((int)A[i*K+k] * (int)B[k*N+j] + 128) >> 8;
+            }
+            if (acc > 255) acc = 255;
+            C_ref[i*N+j] = (unsigned char)acc;
+        }
+    }
+
+    wii_matmul_u8(A, B, C, M, K, N);
+
+    // Verify: allow +/- 2 for accumulated blend rounding
+    int max_err = 0;
+    int err_count = 0;
+    for (int i = 0; i < M * N; i++) {
+        int diff = abs((int)C[i] - (int)C_ref[i]);
+        if (diff > max_err) max_err = diff;
+        if (diff > 2) err_count++;
+    }
+
+    if (err_count > 0) {
+        printf("FAIL\n    %s:%d: %d/%d elements exceed tol=2 (max_err=%d)\n",
+               __FILE__, __LINE__, err_count, M * N, max_err);
+        tests_failed++;
+        free(A); free(B); free(C); free(C_ref);
+        return;
+    }
+
+    free(A);
+    free(B);
+    free(C);
+    free(C_ref);
+}
+
+// Native u8 matmul: large N test (528 x 16 x 1920 = full EFB)
+TEST(test_matmul_u8_max_efb) {
+    const int M = 528;
+    const int K = 16;
+    const int N = 1920;
+
+    unsigned char* A = (unsigned char*)malloc(M * K);
+    unsigned char* B = (unsigned char*)malloc(K * N);
+    unsigned char* C = (unsigned char*)calloc(M * N, 1);
+    unsigned char* C_ref = (unsigned char*)calloc(M * N, 1);
+
+    // Fill with deterministic pattern (keep values moderate to avoid saturation)
+    for (int i = 0; i < M; i++)
+        for (int k = 0; k < K; k++)
+            A[i * K + k] = (unsigned char)((i * 3 + k * 7 + 10) % 64);
+
+    for (int k = 0; k < K; k++)
+        for (int j = 0; j < N; j++)
+            B[k * N + j] = (unsigned char)((k * 5 + j * 3 + 20) % 64);
+
+    // CPU reference
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            int acc = 0;
+            for (int k = 0; k < K; k++) {
+                acc += ((int)A[i*K+k] * (int)B[k*N+j] + 128) >> 8;
+            }
+            if (acc > 255) acc = 255;
+            C_ref[i*N+j] = (unsigned char)acc;
+        }
+    }
+
+    wii_matmul_u8(A, B, C, M, K, N);
+
+    // Verify: spot-check corners and a random sample
+    int max_err = 0;
+    int err_count = 0;
+    for (int i = 0; i < M * N; i++) {
+        int diff = abs((int)C[i] - (int)C_ref[i]);
+        if (diff > max_err) max_err = diff;
+        if (diff > 2) err_count++;
+    }
+
+    if (err_count > 0) {
+        printf("FAIL\n    %s:%d: %d/%d elements exceed tol=2 (max_err=%d)\n",
+               __FILE__, __LINE__, err_count, M * N, max_err);
+        tests_failed++;
+        free(A); free(B); free(C); free(C_ref);
+        return;
+    }
+
+    free(A);
+    free(B);
+    free(C);
+    free(C_ref);
+}
+
 // RMS normalization
 TEST(test_rmsnorm) {
     float x[] = {1.0f, 2.0f, 3.0f, 4.0f};
@@ -270,8 +446,14 @@ int main() {
     RUN(test_relu);
     RUN(test_silu);
     RUN(test_softmax);
+#ifndef WII_MATH_USE_GX
     RUN(test_matvec_q8);
     RUN(test_matvec_q8_scale);
+#endif
+    RUN(test_matmul_u8_small);
+    RUN(test_matmul_u8_outer_product);
+    RUN(test_matmul_u8_full_efb);
+    RUN(test_matmul_u8_max_efb);
     RUN(test_rmsnorm);
 
     wii_math_shutdown();

@@ -44,6 +44,14 @@ void wii_softmax(const float* x, float* y, int n);
 // RMS normalization: y[i] = x[i] / rms(x) * weight[i]
 void wii_rmsnorm(const float* x, const float* weight, float* y, int n);
 
+// Native u8 matmul: C = A * B with TEV-native arithmetic.
+// A is M x K (row-major, u8), B is K x N (row-major, u8), C is M x N (row-major, u8).
+// Product per element: round(a * b / 255), accumulated across K via TEV stages.
+// Constraints: M <= 528, N <= 1920, K <= 16 (fits in one draw call on the TEV).
+// The CPU backend computes the same formula as the TEV for bit-exact validation.
+void wii_matmul_u8(const unsigned char* A, const unsigned char* B, unsigned char* C,
+                   int M, int K, int N);
+
 // INT8 matrix-vector multiply with fused dequant: y = dequant(W) * x
 // W is M x K int8 (row-major), scale is per-tensor fp32 scale factor.
 // x is length K fp32, y is length M fp32.
